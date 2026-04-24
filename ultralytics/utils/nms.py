@@ -151,7 +151,10 @@ def non_max_suppression(
             if "torchvision" in sys.modules:
                 import torchvision  # scope as slow import
 
-                i = torchvision.ops.nms(boxes, scores, iou_thres)
+                try:
+                    i = torchvision.ops.nms(boxes, scores, iou_thres)
+                except (RuntimeError, AttributeError):
+                    i = TorchNMS.nms(boxes, scores, iou_thres)
             else:
                 i = TorchNMS.nms(boxes, scores, iou_thres)
         i = i[:max_det]  # limit detections
