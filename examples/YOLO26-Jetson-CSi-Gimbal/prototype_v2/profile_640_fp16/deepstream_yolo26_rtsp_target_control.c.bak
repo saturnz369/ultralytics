@@ -98,50 +98,6 @@ typedef struct AppState {
   GstRTSPServer *rtsp_server;
 } AppState;
 
-/* ===== LATENCY STAGE 3 ADDED START =====
- * Stage 3 records coarse DeepStream element timing on the same GstBuffer.
- * These timestamps are best-effort: they measure when the buffer passes selected
- * GStreamer pads, not the exact internal GPU kernel duration.
- */
-typedef struct LatencyStage3BufferTimes {
-  gint64 mux_src_mono_ns;
-  gint64 pgie_src_mono_ns;
-} LatencyStage3BufferTimes;
-
-static GQuark
-latency_stage3_quark(void)
-{
-  static GQuark quark = 0;
-  if (G_UNLIKELY(quark == 0)) {
-    quark = g_quark_from_static_string("prototype-v2-latency-stage3-times");
-  }
-  return quark;
-}
-
-static gint64
-latency_mono_ns(void)
-{
-  return g_get_monotonic_time() * 1000LL;
-}
-
-static LatencyStage3BufferTimes *
-latency_stage3_get_or_create(GstBuffer *buf)
-{
-  LatencyStage3BufferTimes *times = NULL;
-  if (!buf) {
-    return NULL;
-  }
-  times = (LatencyStage3BufferTimes *) gst_mini_object_get_qdata(
-      GST_MINI_OBJECT(buf), latency_stage3_quark());
-  if (!times) {
-    times = g_new0(LatencyStage3BufferTimes, 1);
-    gst_mini_object_set_qdata(
-        GST_MINI_OBJECT(buf), latency_stage3_quark(), times, g_free);
-  }
-  return times;
-}
-/* ===== LATENCY STAGE 3 ADDED END ===== */
-
 static gchar *
 env_strdup_default(const gchar *key, const gchar *fallback)
 {
@@ -729,47 +685,9 @@ choose_candidate(TrackCandidate *candidates, guint count, const AppConfig *cfg)
   return best;
 }
 
-/* ===== LATENCY STAGE 3 ADDED START =====
- * Pad probes used to timestamp the buffer after streammux and after nvinfer.
- * The existing tracker src probe later reads these timestamps and writes them to JSON.
- */
-static GstPadProbeReturn
-latency_stage3_mux_src_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-  (void) pad;
-  (void) user_data;
-  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
-  LatencyStage3BufferTimes *times = latency_stage3_get_or_create(buf);
-  if (times) {
-    times->mux_src_mono_ns = latency_mono_ns();
-  }
-  return GST_PAD_PROBE_OK;
-}
-
-static GstPadProbeReturn
-latency_stage3_pgie_src_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-  (void) pad;
-  (void) user_data;
-  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
-  LatencyStage3BufferTimes *times = latency_stage3_get_or_create(buf);
-  if (times) {
-    times->pgie_src_mono_ns = latency_mono_ns();
-  }
-  return GST_PAD_PROBE_OK;
-}
-/* ===== LATENCY STAGE 3 ADDED END ===== */
-
 static void
 write_state_json(FILE *fp,
                  guint frame_idx,
-                 /* ===== LATENCY STAGE 2/3 ADDED START ===== */
-                 gint64 c_probe_start_mono_ns,
-                 gint64 c_control_done_mono_ns,
-                 gint64 mux_src_mono_ns,
-                 gint64 pgie_src_mono_ns,
-                 gint64 tracker_src_mono_ns,
-                 /* ===== LATENCY STAGE 2/3 ADDED END ===== */
                  const gchar *status,
                  const gchar *command_status,
                  guint visible_tracks,
@@ -782,39 +700,10 @@ write_state_json(FILE *fp,
                  gdouble pan_cmd,
                  gdouble tilt_cmd)
 {
-  /* ===== LATENCY STAGE 1 ADDED START =====
-   * Stage 1 T1 timestamp: this is the moment the DeepStream C app writes the
-   * tracking/control metadata line. GLib returns monotonic time in
-   * microseconds, so multiply by 1000 to store nanoseconds.
-   *
-   * Python reads this as ds_write_mono_ns and compares it with
-   * time.monotonic_ns(). This is for same-machine latency measurement.
-   * Remove only this block and the JSON field below if you want to undo.
-   */
-  const gint64 ds_write_mono_ns = g_get_monotonic_time() * 1000LL;
-  /* ===== LATENCY STAGE 1 ADDED END ===== */
-
   fprintf(fp,
-          "{\"frame_idx\":%u,"
-          "\"ds_write_mono_ns\":%" G_GINT64_FORMAT ","
-          /* ===== LATENCY STAGE 2 ADDED START ===== */
-          "\"c_probe_start_mono_ns\":%" G_GINT64_FORMAT ","
-          "\"c_control_done_mono_ns\":%" G_GINT64_FORMAT ","
-          /* ===== LATENCY STAGE 2 ADDED END ===== */
-          /* ===== LATENCY STAGE 3 ADDED START ===== */
-          "\"mux_src_mono_ns\":%" G_GINT64_FORMAT ","
-          "\"pgie_src_mono_ns\":%" G_GINT64_FORMAT ","
-          "\"tracker_src_mono_ns\":%" G_GINT64_FORMAT ","
-          /* ===== LATENCY STAGE 3 ADDED END ===== */
-          "\"status\":\"%s\",\"command_status\":\"%s\",\"visible_tracks\":%u,"
+          "{\"frame_idx\":%u,\"status\":\"%s\",\"command_status\":\"%s\",\"visible_tracks\":%u,"
           "\"lost_frames\":%u,\"target_id\":",
           frame_idx,
-          ds_write_mono_ns,
-          c_probe_start_mono_ns,
-          c_control_done_mono_ns,
-          mux_src_mono_ns,
-          pgie_src_mono_ns,
-          tracker_src_mono_ns,
           status,
           command_status,
           visible_tracks,
@@ -849,20 +738,6 @@ tracker_src_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_d
   (void) pad;
   AppState *state = (AppState *) user_data;
   GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
-  /* ===== LATENCY STAGE 2/3 ADDED START =====
-   * Stage 2 starts when this tracker-src probe begins handling the buffer.
-   * Stage 3 tracker timestamp is also captured here because this probe is located
-   * after nvtracker in the DeepStream pipeline.
-   */
-  const gint64 c_probe_start_mono_ns = latency_mono_ns();
-  const LatencyStage3BufferTimes *latency_stage3_times =
-      buf ? (const LatencyStage3BufferTimes *) gst_mini_object_get_qdata(
-                GST_MINI_OBJECT(buf), latency_stage3_quark())
-          : NULL;
-  const gint64 mux_src_mono_ns = latency_stage3_times ? latency_stage3_times->mux_src_mono_ns : 0;
-  const gint64 pgie_src_mono_ns = latency_stage3_times ? latency_stage3_times->pgie_src_mono_ns : 0;
-  const gint64 tracker_src_mono_ns = c_probe_start_mono_ns;
-  /* ===== LATENCY STAGE 2/3 ADDED END ===== */
   NvDsBatchMeta *batch_meta = gst_buffer_get_nvds_batch_meta(buf);
   NvDsMetaList *l_frame = NULL;
 
@@ -981,13 +856,6 @@ tracker_src_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_d
       state->last_control_time_usec = 0;
     }
 
-    /* ===== LATENCY STAGE 2 ADDED START =====
-     * Stage 2 control timestamp: target selection, error calculation, command
-     * shaping and feedforward are done. Overlay/JSON writing happens after this.
-     */
-    const gint64 c_control_done_mono_ns = latency_mono_ns();
-    /* ===== LATENCY STAGE 2 ADDED END ===== */
-
     if (selected) {
       g_snprintf(target_id_buf, sizeof(target_id_buf), "%" G_GUINT64_FORMAT, selected->track_id);
     } else {
@@ -1028,13 +896,6 @@ tracker_src_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_d
       write_state_json(
           state->state_fp,
           state->frame_number,
-          /* ===== LATENCY STAGE 2/3 ADDED START ===== */
-          c_probe_start_mono_ns,
-          c_control_done_mono_ns,
-          mux_src_mono_ns,
-          pgie_src_mono_ns,
-          tracker_src_mono_ns,
-          /* ===== LATENCY STAGE 2/3 ADDED END ===== */
           status,
           command_status,
           visible_tracks,
@@ -1091,10 +952,6 @@ main(int argc, char *argv[])
   gchar *encoder_caps_str = NULL;
   GstPad *mux_sink_pad = NULL;
   GstPad *source_src_pad = NULL;
-  /* ===== LATENCY STAGE 3 ADDED START ===== */
-  GstPad *mux_src_pad = NULL;
-  GstPad *pgie_src_pad = NULL;
-  /* ===== LATENCY STAGE 3 ADDED END ===== */
   GstPad *tracker_src_pad = NULL;
   GstPad *tee_display_pad = NULL;
   GstPad *tee_rtsp_pad = NULL;
@@ -1251,23 +1108,6 @@ main(int argc, char *argv[])
     goto cleanup;
   }
 
-  /* ===== LATENCY STAGE 3 ADDED START =====
-   * Add coarse DeepStream element timing probes.
-   */
-  mux_src_pad = gst_element_get_static_pad(streammux, "src");
-  pgie_src_pad = gst_element_get_static_pad(pgie, "src");
-  if (mux_src_pad) {
-    gst_pad_add_probe(mux_src_pad, GST_PAD_PROBE_TYPE_BUFFER, latency_stage3_mux_src_probe, &state, NULL);
-  } else {
-    g_printerr("Warning: failed to get streammux src pad for latency stage 3.\n");
-  }
-  if (pgie_src_pad) {
-    gst_pad_add_probe(pgie_src_pad, GST_PAD_PROBE_TYPE_BUFFER, latency_stage3_pgie_src_probe, &state, NULL);
-  } else {
-    g_printerr("Warning: failed to get pgie src pad for latency stage 3.\n");
-  }
-  /* ===== LATENCY STAGE 3 ADDED END ===== */
-
   tracker_src_pad = gst_element_get_static_pad(nvtracker, "src");
   if (!tracker_src_pad) {
     g_printerr("Failed to get tracker src pad.\n");
@@ -1296,14 +1136,6 @@ cleanup:
   if (bus_watch_id > 0) {
     g_source_remove(bus_watch_id);
   }
-  /* ===== LATENCY STAGE 3 ADDED START ===== */
-  if (mux_src_pad) {
-    gst_object_unref(mux_src_pad);
-  }
-  if (pgie_src_pad) {
-    gst_object_unref(pgie_src_pad);
-  }
-  /* ===== LATENCY STAGE 3 ADDED END ===== */
   if (tracker_src_pad) {
     gst_object_unref(tracker_src_pad);
   }

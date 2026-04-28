@@ -248,6 +248,8 @@ It is the current main `640x640` FP16 feedforward preset.
 
 ### Main Feedforward Recenter Preset
 
+export RTSP_PORT=8554 
+
 ```bash
 cd /home/aarl/ultralytics
 export SHOW=1

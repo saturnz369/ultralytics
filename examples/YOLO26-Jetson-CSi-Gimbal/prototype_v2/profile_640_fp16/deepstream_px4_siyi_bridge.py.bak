@@ -24,40 +24,6 @@ from px4_siyi_live_bridge import PX4SiyiBridge, mavutil
 class PrototypeV2BridgeState:
     frame_idx: int
     timestamp: float
-    # ===== LATENCY STAGE 1 ADDED START =====
-    # Stage 1: DeepStream metadata output -> Python read -> MAVLink send point.
-    ds_write_mono_ns: int | None
-    py_read_mono_ns: int
-    mav_send_mono_ns: int
-    ds_to_py_ms: float | None
-    py_to_mav_ms: float
-    ds_to_mav_ms: float | None
-    # ===== LATENCY STAGE 1 ADDED END =====
-
-    # ===== LATENCY STAGE 2 ADDED START =====
-    # Stage 2: C tracker-probe/control timing inside deepstream_yolo26_rtsp_target_control.c.
-    c_probe_start_mono_ns: int | None
-    c_control_done_mono_ns: int | None
-    c_probe_to_control_ms: float | None
-    c_control_to_json_ms: float | None
-    c_probe_to_json_ms: float | None
-    # ===== LATENCY STAGE 2 ADDED END =====
-
-    # ===== LATENCY STAGE 3 ADDED START =====
-    # Stage 3: coarse DeepStream element timing between selected pad probes.
-    mux_src_mono_ns: int | None
-    pgie_src_mono_ns: int | None
-    tracker_src_mono_ns: int | None
-    mux_to_pgie_ms: float | None
-    pgie_to_tracker_ms: float | None
-    mux_to_tracker_ms: float | None
-    # ===== LATENCY STAGE 3 ADDED END =====
-
-    # ===== LATENCY STAGE 4 ADDED START =====
-    # Stage 4: Python MAVLink send function call duration.
-    mav_return_mono_ns: int
-    mav_call_ms: float
-    # ===== LATENCY STAGE 4 ADDED END =====
     status: str
     command_status: str
     visible_tracks: int
@@ -173,26 +139,6 @@ def parse_args() -> argparse.Namespace:
 
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
-
-
-def _safe_int_or_none(value) -> int | None:
-    """Return int(value), or None if the field is missing/invalid/non-positive."""
-    if value is None:
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
-
-# ===== LATENCY STAGE 1/2/3/4 ADDED START =====
-def _delta_ms(newer_ns: int | None, older_ns: int | None) -> float | None:
-    """Return millisecond difference between two monotonic-ns timestamps."""
-    if newer_ns is None or older_ns is None:
-        return None
-    return (newer_ns - older_ns) / 1e6
-# ===== LATENCY STAGE 1/2/3/4 ADDED END =====
 
 
 def map_commands_to_rates(pan_cmd: float, tilt_cmd: float, args: argparse.Namespace) -> tuple[float, float]:
@@ -342,23 +288,6 @@ def main() -> int:
                 except json.JSONDecodeError:
                     continue
 
-                # ===== LATENCY STAGE 1/2/3 ADDED START =====
-                # Stage 1 T2: Python has received/read one metadata JSON line.
-                py_read_mono_ns = time.monotonic_ns()
-
-                # Stage 1 T1 from C JSON metadata.
-                ds_write_mono_ns = _safe_int_or_none(record.get("ds_write_mono_ns"))
-
-                # Stage 2 timestamps from C tracker-probe/control timing.
-                c_probe_start_mono_ns = _safe_int_or_none(record.get("c_probe_start_mono_ns"))
-                c_control_done_mono_ns = _safe_int_or_none(record.get("c_control_done_mono_ns"))
-
-                # Stage 3 timestamps from coarse DeepStream element pad probes.
-                mux_src_mono_ns = _safe_int_or_none(record.get("mux_src_mono_ns"))
-                pgie_src_mono_ns = _safe_int_or_none(record.get("pgie_src_mono_ns"))
-                tracker_src_mono_ns = _safe_int_or_none(record.get("tracker_src_mono_ns"))
-                # ===== LATENCY STAGE 1/2/3 ADDED END =====
-
                 status = str(record.get("status", "searching"))
                 command_status = str(record.get("command_status", "no_target"))
                 visible_tracks = int(record.get("visible_tracks", 0) or 0)
@@ -384,28 +313,6 @@ def main() -> int:
                         dt=delta,
                         args=args,
                     )
-                # ===== LATENCY STAGE 1/2/3 ADDED START =====
-                # Stage 1 T3: immediately before this bridge sends the MAVLink command.
-                mav_send_mono_ns = time.monotonic_ns()
-
-                # Stage 1 latency numbers.
-                ds_to_py_ms = _delta_ms(py_read_mono_ns, ds_write_mono_ns)
-                py_to_mav_ms = _delta_ms(mav_send_mono_ns, py_read_mono_ns) or 0.0
-                ds_to_mav_ms = _delta_ms(mav_send_mono_ns, ds_write_mono_ns)
-
-                # Stage 2 latency numbers.
-                c_probe_to_control_ms = _delta_ms(c_control_done_mono_ns, c_probe_start_mono_ns)
-                c_control_to_json_ms = _delta_ms(ds_write_mono_ns, c_control_done_mono_ns)
-                c_probe_to_json_ms = _delta_ms(ds_write_mono_ns, c_probe_start_mono_ns)
-
-                # Stage 3 latency numbers.
-                mux_to_pgie_ms = _delta_ms(pgie_src_mono_ns, mux_src_mono_ns)
-                pgie_to_tracker_ms = _delta_ms(tracker_src_mono_ns, pgie_src_mono_ns)
-                mux_to_tracker_ms = _delta_ms(tracker_src_mono_ns, mux_src_mono_ns)
-                # ===== LATENCY STAGE 1/2/3 ADDED END =====
-
-                # ===== LATENCY STAGE 4 ADDED START =====
-                # Stage 4: measure how long the Python MAVLink send wrapper takes to return.
                 send_live_command(
                     bridge=bridge,
                     args=args,
@@ -414,43 +321,10 @@ def main() -> int:
                     target_pitch_deg=target_pitch_deg,
                     target_yaw_deg=target_yaw_deg,
                 )
-                mav_return_mono_ns = time.monotonic_ns()
-                mav_call_ms = (mav_return_mono_ns - mav_send_mono_ns) / 1e6
-                # ===== LATENCY STAGE 4 ADDED END =====
 
                 state = PrototypeV2BridgeState(
                     frame_idx=int(record.get("frame_idx", -1)),
                     timestamp=time.time(),
-                    # ===== LATENCY STAGE 1 ADDED START =====
-                    ds_write_mono_ns=ds_write_mono_ns,
-                    py_read_mono_ns=py_read_mono_ns,
-                    mav_send_mono_ns=mav_send_mono_ns,
-                    ds_to_py_ms=ds_to_py_ms,
-                    py_to_mav_ms=py_to_mav_ms,
-                    ds_to_mav_ms=ds_to_mav_ms,
-                    # ===== LATENCY STAGE 1 ADDED END =====
-
-                    # ===== LATENCY STAGE 2 ADDED START =====
-                    c_probe_start_mono_ns=c_probe_start_mono_ns,
-                    c_control_done_mono_ns=c_control_done_mono_ns,
-                    c_probe_to_control_ms=c_probe_to_control_ms,
-                    c_control_to_json_ms=c_control_to_json_ms,
-                    c_probe_to_json_ms=c_probe_to_json_ms,
-                    # ===== LATENCY STAGE 2 ADDED END =====
-
-                    # ===== LATENCY STAGE 3 ADDED START =====
-                    mux_src_mono_ns=mux_src_mono_ns,
-                    pgie_src_mono_ns=pgie_src_mono_ns,
-                    tracker_src_mono_ns=tracker_src_mono_ns,
-                    mux_to_pgie_ms=mux_to_pgie_ms,
-                    pgie_to_tracker_ms=pgie_to_tracker_ms,
-                    mux_to_tracker_ms=mux_to_tracker_ms,
-                    # ===== LATENCY STAGE 3 ADDED END =====
-
-                    # ===== LATENCY STAGE 4 ADDED START =====
-                    mav_return_mono_ns=mav_return_mono_ns,
-                    mav_call_ms=mav_call_ms,
-                    # ===== LATENCY STAGE 4 ADDED END =====
                     status=status,
                     command_status=command_status,
                     visible_tracks=visible_tracks,
