@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="/home/aarl/ultralytics/examples/YOLO26-Jetson-CSI-Inference/prototype_v2"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_SCRIPT="${ROOT_DIR}/run_deepstream_yolo26_rtsp.sh"
 
 export RTSP_PORT="${RTSP_PORT:-8554}"

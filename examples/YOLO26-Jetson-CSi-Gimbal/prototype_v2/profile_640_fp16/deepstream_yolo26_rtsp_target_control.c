@@ -3,6 +3,7 @@
 
 #include <gst/gst.h>
 #include <gst/rtsp-server/rtsp-server.h>
+#include <gst/rtsp/gstrtspmessage.h>
 #include <glib.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,6 +60,7 @@ typedef struct AppConfig {
   gint bitrate;
   gint rtsp_queue_buffers;
   gint rtsp_viewer_latency_ms;
+  gchar *rtsp_mount;
   gchar *infer_config;
   gchar *tracker_config;
   gchar *state_file;
@@ -97,6 +99,30 @@ typedef struct AppState {
   gint64 last_control_time_usec;
   GstRTSPServer *rtsp_server;
 } AppState;
+
+typedef struct _Mk15RTSPClient Mk15RTSPClient;
+typedef struct _Mk15RTSPClientClass Mk15RTSPClientClass;
+typedef struct _Mk15RTSPServer Mk15RTSPServer;
+typedef struct _Mk15RTSPServerClass Mk15RTSPServerClass;
+
+struct _Mk15RTSPClient {
+  GstRTSPClient parent;
+};
+
+struct _Mk15RTSPClientClass {
+  GstRTSPClientClass parent_class;
+};
+
+struct _Mk15RTSPServer {
+  GstRTSPServer parent;
+};
+
+struct _Mk15RTSPServerClass {
+  GstRTSPServerClass parent_class;
+};
+
+G_DEFINE_TYPE(Mk15RTSPClient, mk15_rtsp_client, GST_TYPE_RTSP_CLIENT)
+G_DEFINE_TYPE(Mk15RTSPServer, mk15_rtsp_server, GST_TYPE_RTSP_SERVER)
 
 /* ===== LATENCY STAGE 3 ADDED START =====
  * Stage 3 records coarse DeepStream element timing on the same GstBuffer.
@@ -185,6 +211,116 @@ env_bool_default(const gchar *key, gboolean fallback)
   return fallback;
 }
 
+static gboolean
+normalize_play_range(GstRTSPMessage *request)
+{
+  gchar *range = NULL;
+  gchar *trimmed = NULL;
+  gchar *fixed = NULL;
+  gboolean changed = FALSE;
+
+  if (gst_rtsp_message_get_header(request, GST_RTSP_HDR_RANGE, &range, 0) != GST_RTSP_OK ||
+      range == NULL) {
+    return FALSE;
+  }
+
+  trimmed = g_strdup(range);
+  g_strstrip(trimmed);
+  if (g_str_has_prefix(trimmed, "npt=") ||
+      g_str_has_prefix(trimmed, "clock=") ||
+      g_str_has_prefix(trimmed, "smpte=")) {
+    g_free(trimmed);
+    return FALSE;
+  }
+
+  if (!g_regex_match_simple("^[0-9]+(?:\\.[0-9]+)?-$", trimmed, 0, 0)) {
+    g_free(trimmed);
+    return FALSE;
+  }
+
+  fixed = g_strdup_printf("npt=%s", trimmed);
+  gst_rtsp_message_remove_header(request, GST_RTSP_HDR_RANGE, 0);
+  gst_rtsp_message_add_header(request, GST_RTSP_HDR_RANGE, fixed);
+  g_print("Normalized PLAY Range header: '%s' -> '%s'\n", trimmed, fixed);
+  changed = TRUE;
+
+  g_free(fixed);
+  g_free(trimmed);
+  return changed;
+}
+
+static GstRTSPStatusCode
+mk15_pre_play_request(GstRTSPClient *client, GstRTSPContext *ctx)
+{
+  GstRTSPClientClass *parent_class =
+      GST_RTSP_CLIENT_CLASS(mk15_rtsp_client_parent_class);
+
+  normalize_play_range(ctx->request);
+
+  if (parent_class->pre_play_request != NULL) {
+    return parent_class->pre_play_request(client, ctx);
+  }
+
+  return GST_RTSP_STS_OK;
+}
+
+static void
+mk15_rtsp_client_class_init(Mk15RTSPClientClass *klass)
+{
+  GstRTSPClientClass *client_class = GST_RTSP_CLIENT_CLASS(klass);
+  client_class->pre_play_request = mk15_pre_play_request;
+}
+
+static void
+mk15_rtsp_client_init(Mk15RTSPClient *self)
+{
+  (void) self;
+}
+
+static GstRTSPClient *
+mk15_rtsp_server_create_client(GstRTSPServer *server)
+{
+  GstRTSPClient *client = g_object_new(mk15_rtsp_client_get_type(), NULL);
+  GstRTSPSessionPool *session_pool = gst_rtsp_server_get_session_pool(server);
+  GstRTSPMountPoints *mounts = gst_rtsp_server_get_mount_points(server);
+  GstRTSPAuth *auth = gst_rtsp_server_get_auth(server);
+  GstRTSPThreadPool *thread_pool = gst_rtsp_server_get_thread_pool(server);
+
+  if (session_pool != NULL) {
+    gst_rtsp_client_set_session_pool(client, session_pool);
+    g_object_unref(session_pool);
+  }
+  if (mounts != NULL) {
+    gst_rtsp_client_set_mount_points(client, mounts);
+    g_object_unref(mounts);
+  }
+  if (auth != NULL) {
+    gst_rtsp_client_set_auth(client, auth);
+    g_object_unref(auth);
+  }
+  if (thread_pool != NULL) {
+    gst_rtsp_client_set_thread_pool(client, thread_pool);
+    g_object_unref(thread_pool);
+  }
+
+  gst_rtsp_client_set_content_length_limit(
+      client, gst_rtsp_server_get_content_length_limit(server));
+  return client;
+}
+
+static void
+mk15_rtsp_server_class_init(Mk15RTSPServerClass *klass)
+{
+  GstRTSPServerClass *server_class = GST_RTSP_SERVER_CLASS(klass);
+  server_class->create_client = mk15_rtsp_server_create_client;
+}
+
+static void
+mk15_rtsp_server_init(Mk15RTSPServer *self)
+{
+  (void) self;
+}
+
 static void
 load_config(AppConfig *cfg)
 {
@@ -223,12 +359,18 @@ load_config(AppConfig *cfg)
   cfg->bitrate = env_int_default("BITRATE", DEFAULT_RTSP_BITRATE);
   cfg->rtsp_queue_buffers = env_int_default("RTSP_QUEUE_BUFFERS", DEFAULT_RTSP_QUEUE_BUFFERS);
   cfg->rtsp_viewer_latency_ms = env_int_default("RTSP_VIEWER_LATENCY_MS", DEFAULT_RTSP_VIEWER_LATENCY_MS);
+  cfg->rtsp_mount = env_strdup_default("RTSP_MOUNT", "/ds-test");
+  if (cfg->rtsp_mount[0] != '/') {
+    gchar *fixed_mount = g_strdup_printf("/%s", cfg->rtsp_mount);
+    g_free(cfg->rtsp_mount);
+    cfg->rtsp_mount = fixed_mount;
+  }
   cfg->infer_config = env_strdup_default(
       "INFER_CONFIG",
-      "/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/config/config_infer_primary_yolo26.txt");
+      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/config/config_infer_primary_yolo26.txt");
   cfg->tracker_config = env_strdup_default(
       "TRACKER_CONFIG",
-      "/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/config/tracker_config.txt");
+      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/config/tracker_config.txt");
   cfg->state_file = env_strdup_default(
       "STATE_FILE",
       "/tmp/profile640fp16_deepstream_yolo26_target_control.jsonl");
@@ -238,6 +380,7 @@ static void
 free_config(AppConfig *cfg)
 {
   g_free(cfg->selection);
+  g_free(cfg->rtsp_mount);
   g_free(cfg->infer_config);
   g_free(cfg->tracker_config);
   g_free(cfg->state_file);
@@ -264,19 +407,20 @@ start_rtsp_streaming(AppState *state)
       512 * 1024);
   g_snprintf(port_str, sizeof(port_str), "%d", state->cfg.rtsp_port);
 
-  state->rtsp_server = gst_rtsp_server_new();
+  state->rtsp_server = g_object_new(mk15_rtsp_server_get_type(), NULL);
   g_object_set(state->rtsp_server, "service", port_str, NULL);
 
   mounts = gst_rtsp_server_get_mount_points(state->rtsp_server);
   factory = gst_rtsp_media_factory_new();
   gst_rtsp_media_factory_set_launch(factory, launch_desc);
   gst_rtsp_media_factory_set_shared(factory, TRUE);
-  gst_rtsp_mount_points_add_factory(mounts, "/ds-test", factory);
+  gst_rtsp_mount_points_add_factory(mounts, state->cfg.rtsp_mount, factory);
   g_object_unref(mounts);
 
   gst_rtsp_server_attach(state->rtsp_server, NULL);
-  g_print("\n *** prototype_v2: Launched RTSP Streaming at rtsp://localhost:%d/ds-test ***\n\n",
-          state->cfg.rtsp_port);
+  g_print("\n *** prototype_v2: Launched RTSP Streaming at rtsp://localhost:%d%s ***\n\n",
+          state->cfg.rtsp_port,
+          state->cfg.rtsp_mount);
   return TRUE;
 }
 
@@ -1287,7 +1431,7 @@ main(int argc, char *argv[])
   g_print("Infer config: %s\n", state.cfg.infer_config);
   g_print("Tracker config: %s\n", state.cfg.tracker_config);
   g_print("State file: %s\n", state.cfg.state_file);
-  g_print("RTSP URL: rtsp://localhost:%d/ds-test\n", state.cfg.rtsp_port);
+  g_print("RTSP URL: rtsp://localhost:%d%s\n", state.cfg.rtsp_port, state.cfg.rtsp_mount);
 
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
   g_main_loop_run(state.loop);

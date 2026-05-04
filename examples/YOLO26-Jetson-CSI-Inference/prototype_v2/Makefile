@@ -3,7 +3,7 @@ CUDA_VER ?= $(shell basename $$(readlink -f /usr/local/cuda) | sed 's/cuda-//')
 APPS := deepstream_yolo26_metadata_dump deepstream_yolo26_target_control deepstream_yolo26_rtsp_target_control
 
 TARGET_DEVICE = $(shell gcc -dumpmachine | cut -f1 -d -)
-NVDS_VERSION := 6.3
+NVDS_VERSION ?= $(shell basename $$(readlink -f /opt/nvidia/deepstream/deepstream) | sed 's/deepstream-//')
 LIB_INSTALL_DIR ?= /opt/nvidia/deepstream/deepstream-$(NVDS_VERSION)/lib/
 
 ifeq ($(TARGET_DEVICE),aarch64)

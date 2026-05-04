@@ -1,38 +1,232 @@
 # Profile 640 FP16
 
-This is the clean `prototype_v2` `640x640` profile copy under:
+This is the real `prototype_v2` `640x640` FP16 profile for the CSI camera + PX4/SIYI gimbal path:
 
-- `/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16`
+- `/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16`
 
-It is kept separate from the old working tree so the structure can be organized cleanly.
+It is separate from the test-only `YOLO26-Jetson-CSI-Inference/prototype_v2` folder. Use this folder for the real gimbal profile.
 
 ## Current Status
 
-- `profile_640_fp16` is now a separate runnable sibling of `profile_320` and `profile_640`
-- the local profile engine now lives at:
+- This profile has been ported from the old Xavier paths to this Orin NX:
+  - old path base: `/home/aarl/...`
+  - current path base: `/home/saturnzzz/...`
+- This profile is configured for YOLO26n `640x640` FP16.
+- Local model artifacts are present:
+  - `model/yolo26n.pt`
+  - `model/yolo26n_native_640.onnx`
   - `model/model_b1_gpu0_fp16.engine`
-- this profile is configured for FP16
-- the active local engine was installed from a matching local `640` FP16 engine artifact after an earlier FP16 engine candidate proved incompatible with this profile
-- DeepStream smoke run is verified from this profile:
-  - engine deserializes successfully
-  - camera path runs
+- The TensorRT engine was built locally on this Orin NX with DeepStream 7.1.
+- DeepStream smoke run is verified:
+  - cached engine deserializes successfully
+  - CSI camera path runs
   - JSONL metadata/control output is written
-- first real local preview is also verified from this profile:
+- Local/RTSP preview is verified:
   - person detection works
   - tracking works
   - control metadata is live
-- bridge dry-run is also verified from this profile:
-  - metadata/control output is read
+  - default local RTSP URL is `rtsp://localhost:8554/ds-test`
+- Bridge dry-run is verified:
+  - metadata/control output is read by `deepstream_px4_siyi_bridge.py`
   - bridge state is written with `mavlink_link="dry-run"`
-- first real physical `PX4 -> SIYI` validation for this FP16 profile is still pending
-- this profile is separate from the FP32 640 profile and should be validated independently
-- live `DeepStream -> PX4 -> SIYI` launch path is copied in place for this profile
+  - `pymavlink` and `pyserial` are installed in `/home/saturnzzz/DeepStream-Yolo/.venv-yolo26-sys`
+- Real physical `PX4 -> SIYI` validation for this FP16 profile is verified.
+- MK15 third-party RTSP path is verified:
+  - camera-only stream works in the MK15 FPV app
+  - YOLO/overlay stream works in the MK15 FPV app
+  - operator steps are in `streaming/README.md`
 
 Current practical meaning:
 
-- `profile_320` remains the known-good tuned baseline
-- `profile_640_fp16` is now ready for separate preview, real bridge, and tuning tests
-- `profile_640_fp16` should be treated as its own profile and tuned independently from `profile_320` and `profile_640`
+- Tracking-only tests do not need PX4 or the gimbal.
+- Bridge dry-run does not need PX4 or the gimbal.
+- Real bridge testing needs PX4/SIYI connected through the serial device, normally `/dev/ttyUSB0`.
+- `profile_640_fp16` should be tuned independently from `profile_320` and `profile_640`.
+
+## Current Hardware / Runtime
+
+- Jetson: Orin NX
+- JetPack/L4T used for the camera driver work: JetPack 6.2.1 / L4T 36.4.4
+- DeepStream: `/opt/nvidia/deepstream/deepstream -> deepstream-7.1`
+- CUDA: `/usr/local/cuda-12.6`
+- Camera: e-con e-CAM121_CUONX / IMX412 CSI camera
+- Camera connector used in the current working setup: CAM1
+- FFC cable requirement from the working hardware setup: 22-pin, 0.5 mm pitch, Type A
+- DeepStream-Yolo parser:
+  - `/home/saturnzzz/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so`
+- Python runtime for model export and bridge:
+  - `/home/saturnzzz/DeepStream-Yolo/.venv-yolo26-sys/bin/python`
+
+## Quick Start
+
+Run all commands from the repo root unless the command says otherwise:
+
+```bash
+cd /home/saturnzzz/ultralytics
+```
+
+### 1. Rebuild The App If Needed
+
+The Makefile detects the installed DeepStream version from `/opt/nvidia/deepstream/deepstream`.
+
+```bash
+cd /home/saturnzzz/ultralytics
+make -C /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16 clean all
+```
+
+### 2. Rebuild The ONNX / Engine If Needed
+
+Only do this if the model or TensorRT engine is missing, or if you intentionally changed the model/config.
+
+```bash
+cd /home/saturnzzz/ultralytics
+bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/prepare_prototype_v2_model.sh
+```
+
+Then launch DeepStream once to build `model/model_b1_gpu0_fp16.engine`:
+
+```bash
+cd /home/saturnzzz/ultralytics
+export SHOW=0
+export RTSP_ENABLE=0
+export MAX_FRAMES=30
+bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/run_deepstream_yolo26_rtsp_target_control.sh
+```
+
+The current Orin NX already has the engine built, so normal launches should deserialize it immediately.
+
+### 3. Tracking / Preview Only
+
+Use this before the gimbal is connected. It does not touch PX4 or SIYI.
+
+```bash
+cd /home/saturnzzz/ultralytics
+export DISPLAY=:1
+export SHOW=1
+export RTSP_ENABLE=1
+export RTSP_PORT=8554
+export SENSOR_ID=0
+export CAMERA_WIDTH=1280
+export CAMERA_HEIGHT=720
+export CAMERA_FPS_N=30
+export CAMERA_FPS_D=1
+export TARGET_CLASS_ID=0
+export SELECTION='center'
+export MAX_FRAMES=0
+export STATE_FILE='/tmp/profile640fp16_tracking_preview.jsonl'
+bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/run_deepstream_yolo26_rtsp_target_control.sh
+```
+
+RTSP URL:
+
+```text
+rtsp://localhost:8554/ds-test
+```
+
+### 4. Bridge Dry-Run
+
+Use this before PX4/SIYI is connected. It starts DeepStream, reads the metadata/control JSONL, computes MAVLink gimbal commands, but does not send them to hardware.
+
+```bash
+cd /home/saturnzzz/ultralytics
+export DRY_RUN_MAVLINK=1
+export PRINT_STATE=1
+export SHOW=0
+export RTSP_ENABLE=0
+export MAX_FRAMES=90
+export SENSOR_ID=0
+export CAMERA_WIDTH=1280
+export CAMERA_HEIGHT=720
+export CAMERA_FPS_N=30
+export CAMERA_FPS_D=1
+export TARGET_CLASS_ID=0
+export SELECTION='center'
+export PAN_GAIN=0.91
+export TILT_GAIN=0.83
+export DEADZONE=0.048
+export SMOOTH_ALPHA=0.39
+export FAST_SMOOTH_ALPHA=0.81
+export FAST_ERROR_ZONE=0.15
+export COMMAND_BOOST_ZONE=0.095
+export MIN_ACTIVE_COMMAND=0.20
+export RESPONSE_GAMMA=0.63
+export PAN_FEEDFORWARD_GAIN=0.18
+export TILT_FEEDFORWARD_GAIN=0.12
+export FEEDFORWARD_ALPHA=0.40
+export FEEDFORWARD_LIMIT=0.14
+export FEEDFORWARD_ACTIVATION_ZONE=0.07
+export MAX_YAW_RATE_DPS=95
+export MAX_PITCH_RATE_DPS=60
+export CONTROL_API=command
+export LIVE_CONTROL_MODE=angle-target
+export MAV_INVERT_PAN=0
+export MAV_INVERT_TILT=0
+export METADATA_STATE_FILE='/tmp/profile640fp16_bridge_metadata_dryrun.jsonl'
+export BRIDGE_STATE_FILE='/tmp/profile640fp16_bridge_state_dryrun.jsonl'
+export DEEPSTREAM_LOG_FILE='/tmp/profile640fp16_bridge_deepstream_dryrun.log'
+bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/run_deepstream_px4_siyi_bridge.sh
+```
+
+Expected dry-run proof in `BRIDGE_STATE_FILE`:
+
+```text
+"mavlink_link":"dry-run"
+"last_configure_ack":"DRY_RUN"
+```
+
+### 5. Real PX4 / SIYI Bridge
+
+Use this only after PX4/SIYI hardware is connected and the serial device is correct.
+
+```bash
+cd /home/saturnzzz/ultralytics
+export DISPLAY=:1
+export SHOW=1
+export RTSP_ENABLE=0
+export TARGET_CLASS_ID=0
+export SELECTION='center'
+export PAN_GAIN=0.91
+export TILT_GAIN=0.83
+export DEADZONE=0.048
+export SMOOTH_ALPHA=0.39
+export FAST_SMOOTH_ALPHA=0.81
+export FAST_ERROR_ZONE=0.15
+export COMMAND_BOOST_ZONE=0.095
+export MIN_ACTIVE_COMMAND=0.20
+export RESPONSE_GAMMA=0.63
+export PAN_FEEDFORWARD_GAIN=0.18
+export TILT_FEEDFORWARD_GAIN=0.12
+export FEEDFORWARD_ALPHA=0.40
+export FEEDFORWARD_LIMIT=0.14
+export FEEDFORWARD_ACTIVATION_ZONE=0.07
+export MAX_YAW_RATE_DPS=95
+export MAX_PITCH_RATE_DPS=60
+export CONTROL_API=command
+export LIVE_CONTROL_MODE=angle-target
+export MAV_INVERT_PAN=0
+export MAV_INVERT_TILT=0
+export SERIAL_DEVICE='/dev/ttyUSB0'
+export SERIAL_BAUD=921600
+export MAV_SOURCE_SYSTEM=42
+export MAV_SOURCE_COMPONENT=191
+export MAV_TARGET_SYSTEM=1
+export MAV_TARGET_COMPONENT=154
+export GIMBAL_DEVICE_ID=154
+export METADATA_STATE_FILE='/tmp/profile640fp16_live_metadata.jsonl'
+export BRIDGE_STATE_FILE='/tmp/profile640fp16_live_bridge.jsonl'
+bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/run_deepstream_px4_siyi_bridge.sh
+```
+
+For real bridge testing, `RTSP_ENABLE=0` keeps the load lower. Change it to `RTSP_ENABLE=1` only when you also need the RTSP monitoring stream.
+
+Current recommended bridge mode for the current gimbal + camera mount:
+
+- `CONTROL_API=command`
+- `LIVE_CONTROL_MODE=angle-target`
+- `MAV_INVERT_PAN=0`
+- `MAV_INVERT_TILT=0`
+
+This keeps the old tuned tracking values, but uses the current working MAVLink bridge behavior for the new gimbal/mount setup.
 
 ## How This Profile Works
 
@@ -190,11 +384,14 @@ That is why `prototype_v2` is the future optimized direction:
 - `model/labels.txt`
   - class labels used by the model
 
+- `model/yolo26n.pt`
+  - local YOLO26n PyTorch weight used by `prepare_prototype_v2_model.sh`
+
 - `model/yolo26n_native_640.onnx`
   - native `640x640` ONNX model for this profile
 
 - `model/model_b1_gpu0_fp16.engine`
-  - active TensorRT engine used by this profile
+  - active TensorRT engine built on this Orin NX and used by this profile
 
 - `config/config_infer_primary_yolo26.txt`
   - DeepStream infer config for this profile
@@ -241,49 +438,32 @@ So the important idea is:
 - the second Python file is the MAVLink backend
 - the `.sh` files are only launch helpers around those pieces
 
-## Bridge Presets
+## Controller Preset
 
-This is the single kept preset for `profile_640_fp16`.
-It is the current main `640x640` FP16 feedforward preset.
-
-### Main Feedforward Recenter Preset
-
-export RTSP_PORT=8554 
+The launch scripts already default to the current `640x640` FP16 feedforward recenter preset:
 
 ```bash
-cd /home/aarl/ultralytics
-export SHOW=1
-export RTSP_ENABLE=0
-export TARGET_CLASS_ID=0
-export SELECTION='center'
-export PAN_GAIN=0.91
-export TILT_GAIN=0.83
-export DEADZONE=0.048
-export SMOOTH_ALPHA=0.39
-export FAST_SMOOTH_ALPHA=0.81
-export FAST_ERROR_ZONE=0.15
-export COMMAND_BOOST_ZONE=0.095
-export MIN_ACTIVE_COMMAND=0.20
-export RESPONSE_GAMMA=0.63
-export PAN_FEEDFORWARD_GAIN=0.18
-export TILT_FEEDFORWARD_GAIN=0.12
-export FEEDFORWARD_ALPHA=0.40
-export FEEDFORWARD_LIMIT=0.14
-export FEEDFORWARD_ACTIVATION_ZONE=0.07
-export MAX_YAW_RATE_DPS=95
-export MAX_PITCH_RATE_DPS=60
-export SERIAL_DEVICE='/dev/ttyUSB0'
-export SERIAL_BAUD=921600
-export MAV_SOURCE_SYSTEM=42
-export MAV_SOURCE_COMPONENT=191
-export MAV_TARGET_SYSTEM=1
-export MAV_TARGET_COMPONENT=154
-export GIMBAL_DEVICE_ID=154
-export BRIDGE_STATE_FILE='/tmp/profile640fp16_main_feedforward_recenter.jsonl'
-bash /home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/run_deepstream_px4_siyi_bridge.sh
+TARGET_CLASS_ID=0
+SELECTION=center
+PAN_GAIN=0.91
+TILT_GAIN=0.83
+DEADZONE=0.048
+SMOOTH_ALPHA=0.39
+FAST_SMOOTH_ALPHA=0.81
+FAST_ERROR_ZONE=0.15
+COMMAND_BOOST_ZONE=0.095
+MIN_ACTIVE_COMMAND=0.20
+RESPONSE_GAMMA=0.63
+PAN_FEEDFORWARD_GAIN=0.18
+TILT_FEEDFORWARD_GAIN=0.12
+FEEDFORWARD_ALPHA=0.40
+FEEDFORWARD_LIMIT=0.14
+FEEDFORWARD_ACTIVATION_ZONE=0.07
+MAX_YAW_RATE_DPS=95
+MAX_PITCH_RATE_DPS=60
 ```
 
-Use this as the default `profile_640_fp16` live preset. It keeps the feedforward controller, improves mid/far pull over the older balanced preset, and stays calm near center without the over-aggressive behavior from the later failed tries.
+Use the Quick Start commands above first. Only export these variables manually when tuning or intentionally overriding the defaults.
 
 ## Tuning Guide
 
@@ -394,62 +574,62 @@ This order is best for the current goal:
 ## Code Proof Map
 
 `CSI camera -> DeepStream pipeline`
-- The camera source is `nvarguscamerasrc` in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:881).
+- The camera source is `nvarguscamerasrc` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1112).
 
 - The main pipeline chain is built as:
   - `nvarguscamerasrc -> capsfilter -> nvvideoconvert -> nvstreammux -> nvinfer -> nvtracker -> nvvideoconvert -> nvdsosd -> tee`
 
-- You can see that chain in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:977) and [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:994).
+- You can see that chain in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1213) and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1225).
 
 
 
 `DeepStream -> YOLO detection`
-- The detector is `nvinfer` as `pgie` in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:885).
+- The detector is `nvinfer` as `pgie` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1116).
 
-- Its config file is loaded with `config-file-path` in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:936).
+- Its config file is loaded with `config-file-path` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1167).
 
 
 
 `YOLO detection -> tracker`
-- The tracker is `nvtracker` in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:886).
+- The tracker is `nvtracker` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1117).
 
-- Tracker config is loaded in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:937).
+- Tracker config is loaded in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1168).
 
 
 
 `Tracked metadata -> selected target`
-- The app reads `NvDsObjectMeta` directly from DeepStream metadata in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:443).
+- The app reads `NvDsObjectMeta` directly from DeepStream metadata in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:530).
 
-- It extracts bbox center `cx/cy` in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:462).
+- It extracts bbox center `cx/cy` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:548).
 
-- It selects one target in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:605) and [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:733).
+- It selects one target in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:691) and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:901).
 
 
 
 `Selected target -> dx_norm/dy_norm -> pan_cmd/tilt_cmd`
-- Normalized image-plane error is computed in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:746).
+- Normalized image-plane error is computed in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:913).
 
-- The shaped control output `pan_cmd/tilt_cmd` is computed in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:757).
+- The shaped control output `pan_cmd/tilt_cmd` is computed in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:951).
 
 
 
 **Where the diagram’s two branches appear in code**
 
 `Branch A: video / stream / monitoring`
-- After OSD, the code creates a real `tee` in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:889).
+- After OSD, the code creates a real `tee` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1120).
 
-- One branch goes to local display in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:999).
+- One branch goes to local display in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1230).
 
-- Another branch goes to RTSP encode/pay/sink in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1004) and [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1017).
+- Another branch goes to RTSP encode/pay/sink in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1235) and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1248).
 
 
 
 `Branch B: metadata / control`
 - This branch is not a GStreamer `tee`; it is implemented by a pad probe on the tracker output.
 
-- The probe is attached at `tracker src pad` in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1023) and [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1028).
+- The probe is attached at `tracker src pad` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1273) and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1276).
 
-- Inside that probe, the code reads `NvDsBatchMeta / NvDsFrameMeta / NvDsObjectMeta`, selects a target, computes error, computes commands, and writes JSONL in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:693), [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:807), and [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:647).
+- Inside that probe, the code reads `NvDsBatchMeta / NvDsFrameMeta / NvDsObjectMeta`, selects a target, computes error, computes commands, and writes JSONL in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:878), [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:913), and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:778).
 
 
 
@@ -459,17 +639,17 @@ That is the strongest proof that `prototype_v2` matches your diagram:
 - no separate full-frame CPU image-processing control loop is used here
 
 **Proof that gimbal control uses metadata, not the stream**
-- The C app writes only metadata/control values like `dx_norm`, `dy_norm`, `pan_cmd`, `tilt_cmd` in [deepstream_yolo26_rtsp_target_control.c](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:661).
+- The C app writes only metadata/control values like `dx_norm`, `dy_norm`, `pan_cmd`, `tilt_cmd` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:799).
 
-- The Python bridge reads that JSONL file line by line in [deepstream_px4_siyi_bridge.py](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:273).
+- The Python bridge reads that JSONL file line by line in [deepstream_px4_siyi_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:327).
 
-- It reads `pan_cmd/tilt_cmd` in [deepstream_px4_siyi_bridge.py](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:295).
+- It reads `pan_cmd/tilt_cmd` in [deepstream_px4_siyi_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:366).
 
-- It maps them into yaw/pitch motion in [deepstream_px4_siyi_bridge.py](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:306).
+- It maps them into yaw/pitch motion in [deepstream_px4_siyi_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:377).
 
-- It sends live gimbal commands in [deepstream_px4_siyi_bridge.py](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:316).
+- It sends live gimbal commands in [deepstream_px4_siyi_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:409).
 
-- The low-level MAVLink send is in [px4_siyi_live_bridge.py](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:98), [px4_siyi_live_bridge.py](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:199), and [px4_siyi_live_bridge.py](/home/aarl/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:232).
+- The low-level MAVLink send is in [px4_siyi_live_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:98), [px4_siyi_live_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:199), and [px4_siyi_live_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:232).
 
 So the real control chain in code is:
 
@@ -486,5 +666,3 @@ NvDsObjectMeta
 ```
 
 That is exactly the code-level proof that `prototype_v2` follows the diagram idea.
-
-

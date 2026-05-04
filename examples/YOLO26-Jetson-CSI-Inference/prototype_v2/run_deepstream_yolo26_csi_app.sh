@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="/home/aarl/ultralytics/examples/YOLO26-Jetson-CSI-Inference/prototype_v2"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${ROOT_DIR}/config"
 TMP_CONFIG="$(mktemp /tmp/prototype_v2_ds_app_XXXXXX.txt)"
 trap 'rm -f "${TMP_CONFIG}"' EXIT

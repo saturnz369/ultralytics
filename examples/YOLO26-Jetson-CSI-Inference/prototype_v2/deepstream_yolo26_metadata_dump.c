@@ -86,7 +86,7 @@ load_config(AppConfig *cfg)
   cfg->max_frames = (guint) env_int_default("MAX_FRAMES", 0);
   cfg->infer_config = env_strdup_default(
       "INFER_CONFIG",
-      "/home/aarl/ultralytics/examples/YOLO26-Jetson-CSI-Inference/prototype_v2/config/config_infer_primary_yolo26.txt");
+      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSI-Inference/prototype_v2/config/config_infer_primary_yolo26.txt");
   cfg->state_file = env_strdup_default("STATE_FILE", "/tmp/deepstream_yolo26_metadata.jsonl");
 }
 

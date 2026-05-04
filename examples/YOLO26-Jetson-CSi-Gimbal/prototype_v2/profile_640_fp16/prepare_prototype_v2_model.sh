@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}"
 MODEL_DIR="${ROOT_DIR}/model"
-PYTHON_BIN="/home/aarl/DeepStream-Yolo/.venv-yolo26-sys/bin/python"
+PYTHON_BIN="/home/saturnzzz/DeepStream-Yolo/.venv-yolo26-sys/bin/python"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
-WEIGHTS="${WEIGHTS:-/home/aarl/Downloads/yolo26n.pt}"
+WEIGHTS="${WEIGHTS:-${MODEL_DIR}/yolo26n.pt}"
 MODEL_BASENAME="${MODEL_BASENAME:-yolo26n_native_640}"
 IMGSZ="${IMGSZ:-640}"
 SOURCE_DIR="$(dirname "${WEIGHTS}")"
@@ -39,8 +39,8 @@ PY
 )
 
 cp -f "${SOURCE_DIR}/${SOURCE_STEM}.onnx" "${MODEL_DIR}/${MODEL_BASENAME}.onnx"
-if [[ -f "/home/aarl/DeepStream-Yolo/labels.txt" ]]; then
-  cp -f "/home/aarl/DeepStream-Yolo/labels.txt" "${MODEL_DIR}/labels.txt"
+if [[ -f "/home/saturnzzz/DeepStream-Yolo/labels.txt" ]]; then
+  cp -f "/home/saturnzzz/DeepStream-Yolo/labels.txt" "${MODEL_DIR}/labels.txt"
 fi
 rm -f \
   "${MODEL_DIR}/model_b1_gpu0_fp16.engine" \

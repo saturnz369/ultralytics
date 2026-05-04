@@ -146,10 +146,10 @@ load_config(AppConfig *cfg)
   cfg->invert_tilt = env_bool_default("INVERT_TILT", FALSE);
   cfg->infer_config = env_strdup_default(
       "INFER_CONFIG",
-      "/home/aarl/ultralytics/examples/YOLO26-Jetson-CSI-Inference/prototype_v2/config/config_infer_primary_yolo26.txt");
+      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSI-Inference/prototype_v2/config/config_infer_primary_yolo26.txt");
   cfg->tracker_config = env_strdup_default(
       "TRACKER_CONFIG",
-      "/home/aarl/ultralytics/examples/YOLO26-Jetson-CSI-Inference/prototype_v2/config/tracker_config.txt");
+      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSI-Inference/prototype_v2/config/tracker_config.txt");
   cfg->state_file = env_strdup_default(
       "STATE_FILE",
       "/tmp/deepstream_yolo26_target_control.jsonl");
