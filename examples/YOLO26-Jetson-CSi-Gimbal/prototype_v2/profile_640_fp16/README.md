@@ -20,16 +20,18 @@ It is separate from the test-only `YOLO26-Jetson-CSI-Inference/prototype_v2` fol
 - DeepStream smoke run is verified:
   - cached engine deserializes successfully
   - CSI camera path runs
-  - JSONL metadata/control output is written
+  - latest target metadata is published to the live shared-memory snapshot
 - Local/RTSP preview is verified:
   - person detection works
   - tracking works
-  - control metadata is live
+  - monitoring branch is live
   - default local RTSP URL is `rtsp://localhost:8554/ds-test`
 - Bridge dry-run is verified:
-  - metadata/control output is read by `deepstream_px4_siyi_bridge.py`
+  - latest shared-memory control snapshot is read by `deepstream_px4_siyi_bridge.py`
   - bridge state is written with `mavlink_link="dry-run"`
   - `pymavlink` and `pyserial` are installed in `/home/saturnzzz/DeepStream-Yolo/.venv-yolo26-sys`
+- Normal live control now uses a latest-only shared-memory handoff.
+  - raw metadata JSONL is optional debug/audit logging, not a live dependency
 - Real physical `PX4 -> SIYI` validation for this FP16 profile is verified.
 - MK15 third-party RTSP path is verified:
   - camera-only stream works in the MK15 FPV app
@@ -113,8 +115,13 @@ export CAMERA_FPS_D=1
 export TARGET_CLASS_ID=0
 export SELECTION='center'
 export MAX_FRAMES=0
-export STATE_FILE='/tmp/profile640fp16_tracking_preview.jsonl'
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/run_deepstream_yolo26_rtsp_target_control.sh
+```
+
+Optional debug raw metadata log for this run:
+
+```bash
+export STATE_FILE='/tmp/profile640fp16_tracking_preview.jsonl'
 ```
 
 RTSP URL:
@@ -125,7 +132,7 @@ rtsp://localhost:8554/ds-test
 
 ### 4. Bridge Dry-Run
 
-Use this before PX4/SIYI is connected. It starts DeepStream, reads the metadata/control JSONL, computes MAVLink gimbal commands, but does not send them to hardware.
+Use this before PX4/SIYI is connected. It starts DeepStream, reads the latest shared-memory metadata snapshot, computes MAVLink gimbal commands, but does not send them to hardware.
 
 ```bash
 cd /home/saturnzzz/ultralytics
@@ -161,10 +168,15 @@ export CONTROL_API=command
 export LIVE_CONTROL_MODE=angle-target
 export MAV_INVERT_PAN=0
 export MAV_INVERT_TILT=0
-export METADATA_STATE_FILE='/tmp/profile640fp16_bridge_metadata_dryrun.jsonl'
 export BRIDGE_STATE_FILE='/tmp/profile640fp16_bridge_state_dryrun.jsonl'
 export DEEPSTREAM_LOG_FILE='/tmp/profile640fp16_bridge_deepstream_dryrun.log'
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/run_deepstream_px4_siyi_bridge.sh
+```
+
+Optional raw metadata audit log for this run:
+
+```bash
+export METADATA_STATE_FILE='/tmp/profile640fp16_bridge_metadata_dryrun.jsonl'
 ```
 
 Expected dry-run proof in `BRIDGE_STATE_FILE`:
@@ -212,12 +224,17 @@ export MAV_SOURCE_COMPONENT=191
 export MAV_TARGET_SYSTEM=1
 export MAV_TARGET_COMPONENT=154
 export GIMBAL_DEVICE_ID=154
-export METADATA_STATE_FILE='/tmp/profile640fp16_live_metadata.jsonl'
 export BRIDGE_STATE_FILE='/tmp/profile640fp16_live_bridge.jsonl'
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/run_deepstream_px4_siyi_bridge.sh
 ```
 
 For real bridge testing, `RTSP_ENABLE=0` keeps the load lower. Change it to `RTSP_ENABLE=1` only when you also need the RTSP monitoring stream.
+
+Optional raw metadata audit log for this run:
+
+```bash
+export METADATA_STATE_FILE='/tmp/profile640fp16_live_metadata.jsonl'
+```
 
 Current recommended bridge mode for the current gimbal + camera mount:
 
@@ -227,6 +244,86 @@ Current recommended bridge mode for the current gimbal + camera mount:
 - `MAV_INVERT_TILT=0`
 
 This keeps the old tuned tracking values, but uses the current working MAVLink bridge behavior for the new gimbal/mount setup.
+
+### Runtime Timing Fields
+
+When `BRIDGE_STATE_FILE` is enabled, the bridge log can show separation/latency metrics such as:
+
+- `ds_to_py_ms`
+  - live metadata handoff latency from DeepStream publish to Python read
+- `mav_send_to_feedback_ms`
+  - command send to observed PX4/gimbal feedback timing when feedback is available
+- `display_frame_lag`
+  - how many frames the preview branch trails the current control frame
+- `rtsp_frame_lag`
+  - how many frames the RTSP branch trails the current control frame
+
+This is the main proof that the control branch can stay fresher than the monitoring branch.
+
+## Current Clean Runtime Architecture
+
+The current runtime is now much closer to the intended `prototype_v2` design.
+
+Actual live flow:
+
+```text
+CSI camera
+-> DeepStream / YOLO / tracker
+-> tracker src pad-probe
+-> latest-only shared-memory metadata snapshot
+-> separate Python bridge loop
+-> MAVLink / PX4 gimbal-manager
+-> SIYI gimbal
+```
+
+At the same time, the monitoring branch stays on the video side:
+
+```text
+tracker output
+-> leaky video queue
+-> nvvidconv
+-> nvosd
+-> tee
+-> display queue -> local preview
+-> rtsp queue -> H.264 -> RTSP
+```
+
+### What Is Cleanly Separated Now
+
+- Live gimbal commands are **not** sent inside the DeepStream callback.
+- The Python bridge reads only the **latest** metadata snapshot.
+- Slow preview or RTSP no longer causes the bridge to replay old metadata line by line.
+- The display and RTSP paths sit behind leaky queues, so they are allowed to fall behind and drop frames.
+- `RTSP_ENABLE=0` now really disables the RTSP encode/stream branch.
+
+### What This Means In Practice
+
+- The control branch can stay fresher than the monitoring branch.
+- The MK15 stream or local preview may be a few frames behind, and that is acceptable.
+- The important goal is that the gimbal follows fresh target metadata, not old display frames.
+
+The timing fields above are the proof for this:
+
+- `ds_to_py_ms` shows metadata handoff latency into the Python bridge.
+- `display_frame_lag` shows how far preview trails the current control frame.
+- `rtsp_frame_lag` shows how far RTSP trails the current control frame.
+- `mav_send_to_feedback_ms` shows the observed command-to-feedback timing when PX4/gimbal feedback is available.
+
+### Residual Weak Point
+
+The architecture is cleaner now, but it is not the absolute final form yet.
+
+The main remaining weak point is the DeepStream tracker callback:
+
+- it still does target selection and raw target-state extraction in C
+- the common video path still uses one shared OSD stage before the final display/RTSP sink split
+- if debug metadata logging is enabled with flush, it can still do per-frame file sync work
+
+So the system is now in a good practical state, but the most purist end-state would be:
+
+- C tracker probe: extract/select latest target metadata, publish it, return immediately
+- Python bridge loop: read latest snapshot, compute final smoothed control output, send MAVLink
+- Video branch: preview / RTSP / recording only, with full sink isolation if a stable branch-local OSD path is available
 
 ## How This Profile Works
 
@@ -239,7 +336,7 @@ CSI camera
 -> GStreamer / DeepStream video pipeline
 -> primary detector (YOLO)
 -> multi-object tracker
--> target-selection + control-law stage
+-> target-selection + raw metadata publish stage
 -> split into 2 logical branches:
    1. video / monitoring branch
    2. metadata / control branch
@@ -266,16 +363,15 @@ CSI camera
    - it is maintaining tracked targets over time
    - this is what makes single-target follow possible
 
-4. `tracker -> target-selection + control stage`
+4. `tracker -> target-selection + raw metadata stage`
    - one tracked target is selected for control
    - from that selected target, the profile computes the control-side quantities:
      - target center in image coordinates
      - normalized image-plane error:
        - `dx_norm`
        - `dy_norm`
-     - filtered / shaped control output:
-       - `pan_cmd`
-       - `tilt_cmd`
+   - that raw target state is published as the latest snapshot for the Python bridge
+   - the final smoothed / shaped command is computed in the Python bridge, not in the DeepStream C callback
 
 ### The Important Branch Split
 
@@ -308,15 +404,16 @@ DeepStream app
 tracked target metadata
 -> target position / bbox center
 -> normalized image-center error
--> virtual pan_cmd / tilt_cmd
+-> latest shared-memory snapshot
 -> PX4 bridge
+-> filtered / shaped pan_cmd / tilt_cmd
 -> PX4 MAVLink gimbal-manager path
 -> SIYI gimbal
 ```
 
 - this is the real control branch
 - this branch should use lightweight target metadata, not full exported video frames
-- the important control variables are derived from tracked metadata, not from a second full-frame CPU-side image-processing path
+- the important control variables are derived from tracked metadata inside the separate Python bridge loop, not from the RTSP stream and not from a second full-frame CPU image path
 
 So the real control chain is:
 
@@ -325,7 +422,8 @@ detect
 -> track
 -> choose target
 -> compute dx_norm / dy_norm
--> compute pan_cmd / tilt_cmd
+-> publish latest metadata snapshot
+-> Python bridge computes pan_cmd / tilt_cmd
 -> map into MAVLink gimbal commands
 -> send through PX4
 -> move SIYI
@@ -573,96 +671,49 @@ This order is best for the current goal:
 
 ## Code Proof Map
 
+This is the current code-level shape of the real runtime.
+
 `CSI camera -> DeepStream pipeline`
-- The camera source is `nvarguscamerasrc` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1112).
+- The camera source is `nvarguscamerasrc` inside `deepstream_yolo26_rtsp_target_control.c`.
+- The current practical common video chain is:
+  - `nvarguscamerasrc -> capsfilter -> nvvideoconvert -> nvstreammux -> nvinfer -> nvtracker -> video_queue -> nvvideoconvert -> nvdsosd -> tee`
 
-- The main pipeline chain is built as:
-  - `nvarguscamerasrc -> capsfilter -> nvvideoconvert -> nvstreammux -> nvinfer -> nvtracker -> nvvideoconvert -> nvdsosd -> tee`
+`DeepStream tracker -> raw latest metadata`
+- The tracker output probe in `deepstream_yolo26_rtsp_target_control.c` reads `NvDsObjectMeta`, selects one target, and computes raw `dx_norm / dy_norm`.
+- That probe now publishes the latest target snapshot through shared memory.
+- Optional metadata JSONL is only debug/audit output now; it is not the live control dependency.
 
-- You can see that chain in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1213) and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1225).
+`Latest metadata -> Python bridge -> final control output`
+- `deepstream_px4_siyi_bridge.py` reads only the newest shared-memory snapshot.
+- The Python bridge now owns the filtered/smoothed control shaping:
+  - deadzone
+  - smoothing
+  - command boost / gamma shaping
+  - feedforward
+- That bridge then maps the final `pan_cmd / tilt_cmd` into yaw/pitch motion and sends MAVLink through `px4_siyi_live_bridge.py`.
 
+`Video / monitoring branch`
+- The video branch stays in DeepStream.
+- Overlay work is video-side only.
+- After the common OSD stage, a real `tee` splits to:
+  - local preview
+  - RTSP encode / pay / sink
 
-
-`DeepStream -> YOLO detection`
-- The detector is `nvinfer` as `pgie` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1116).
-
-- Its config file is loaded with `config-file-path` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1167).
-
-
-
-`YOLO detection -> tracker`
-- The tracker is `nvtracker` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1117).
-
-- Tracker config is loaded in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1168).
-
-
-
-`Tracked metadata -> selected target`
-- The app reads `NvDsObjectMeta` directly from DeepStream metadata in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:530).
-
-- It extracts bbox center `cx/cy` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:548).
-
-- It selects one target in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:691) and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:901).
-
-
-
-`Selected target -> dx_norm/dy_norm -> pan_cmd/tilt_cmd`
-- Normalized image-plane error is computed in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:913).
-
-- The shaped control output `pan_cmd/tilt_cmd` is computed in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:951).
-
-
-
-**Where the diagram’s two branches appear in code**
-
-`Branch A: video / stream / monitoring`
-- After OSD, the code creates a real `tee` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1120).
-
-- One branch goes to local display in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1230).
-
-- Another branch goes to RTSP encode/pay/sink in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1235) and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1248).
-
-
-
-`Branch B: metadata / control`
-- This branch is not a GStreamer `tee`; it is implemented by a pad probe on the tracker output.
-
-- The probe is attached at `tracker src pad` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1273) and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:1276).
-
-- Inside that probe, the code reads `NvDsBatchMeta / NvDsFrameMeta / NvDsObjectMeta`, selects a target, computes error, computes commands, and writes JSONL in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:878), [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:913), and [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:778).
-
-
-
-That is the strongest proof that `prototype_v2` matches your diagram:
-- video branch stays in DeepStream
-- control branch uses metadata from the tracker path
-- no separate full-frame CPU image-processing control loop is used here
-
-**Proof that gimbal control uses metadata, not the stream**
-- The C app writes only metadata/control values like `dx_norm`, `dy_norm`, `pan_cmd`, `tilt_cmd` in [deepstream_yolo26_rtsp_target_control.c](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_yolo26_rtsp_target_control.c:799).
-
-- The Python bridge reads that JSONL file line by line in [deepstream_px4_siyi_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:327).
-
-- It reads `pan_cmd/tilt_cmd` in [deepstream_px4_siyi_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:366).
-
-- It maps them into yaw/pitch motion in [deepstream_px4_siyi_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:377).
-
-- It sends live gimbal commands in [deepstream_px4_siyi_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/deepstream_px4_siyi_bridge.py:409).
-
-- The low-level MAVLink send is in [px4_siyi_live_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:98), [px4_siyi_live_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:199), and [px4_siyi_live_bridge.py](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/px4_siyi_live_bridge.py:232).
-
-So the real control chain in code is:
+So the real live control chain is now:
 
 ```text
 NvDsObjectMeta
--> bbox center
+-> target selection
 -> dx_norm / dy_norm
--> pan_cmd / tilt_cmd
--> JSONL metadata/control output
--> Python bridge
+-> latest shared-memory snapshot
+-> Python bridge computes pan_cmd / tilt_cmd
 -> MAVLink
 -> PX4
 -> SIYI
 ```
 
-That is exactly the code-level proof that `prototype_v2` follows the diagram idea.
+That is the current code-level proof that:
+
+- the gimbal does not follow the RTSP video
+- the bridge does not replay old metadata line by line
+- the final control shaping is outside the DeepStream callback

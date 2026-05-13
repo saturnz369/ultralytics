@@ -47,6 +47,14 @@ Important separation:
 - The `RTSP stream` is the video/monitoring path.
 - The `gimbal control` path is separate and uses metadata/MAVLink, not the RTSP video itself.
 
+For the full combined mode, the current live control path is:
+
+```text
+DeepStream tracker -> latest shared-memory metadata snapshot -> Python MAVLink bridge -> PX4 -> SIYI
+```
+
+So the MK15 stream is the monitoring/output branch, while the gimbal follows the separate metadata/control branch.
+
 ## Output Settings
 
 Current default RTSP output to the MK15 handheld is:
@@ -238,6 +246,12 @@ It already uses the tuned `profile_640_fp16` defaults for:
   - `MAV_INVERT_PAN=0`
   - `MAV_INVERT_TILT=0`
 
+Normal live control now uses the latest-only shared-memory handoff between DeepStream and the Python bridge.
+
+- `METADATA_STATE_FILE` is no longer needed for normal runs.
+- Raw metadata JSONL is now optional debug/audit logging only.
+- `BRIDGE_STATE_FILE` can still be kept for timing/status inspection.
+
 ```bash
 cd /home/saturnzzz/ultralytics
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/streaming/run_mk15_yolo_gimbal_rtsp.sh
@@ -317,7 +331,6 @@ export MAV_SOURCE_COMPONENT=191
 export MAV_TARGET_SYSTEM=1
 export MAV_TARGET_COMPONENT=154
 export GIMBAL_DEVICE_ID=154
-export METADATA_STATE_FILE='/tmp/profile640fp16_live_metadata.jsonl'
 export BRIDGE_STATE_FILE='/tmp/profile640fp16_live_bridge.jsonl'
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/streaming/run_mk15_yolo_gimbal_rtsp.sh
 ```
@@ -329,6 +342,45 @@ Use this advanced style when you want to change things like:
 - `MAX_YAW_ANGLE_DEG`, `MIN_PITCH_ANGLE_DEG`, `MAX_PITCH_ANGLE_DEG`
 - `TARGET_CLASS_ID`, `SELECTION`
 - `SHOW`
+
+### Optional Debug / Audit Logging
+
+If you want the old raw DeepStream metadata JSONL for audit/debug, add it explicitly:
+
+```bash
+export METADATA_STATE_FILE='/tmp/profile640fp16_live_metadata.jsonl'
+```
+
+Normal runs do not need that variable anymore. The live control path already uses shared memory. Keeping it off reduces extra probe-side file I/O.
+
+## Timing Metrics
+
+The bridge state log can now show whether the monitoring branch is lagging behind the control branch.
+
+Most useful fields:
+
+- `ds_to_py_ms`
+  - Time from DeepStream publishing the latest target snapshot to the Python bridge reading it.
+  - This is the live metadata handoff latency.
+- `mav_send_to_feedback_ms`
+  - Time from Jetson sending the MAVLink gimbal command to the latest matching PX4/gimbal feedback we observed.
+  - This only appears when real feedback is available.
+- `display_frame_lag`
+  - How many frames the local display branch is behind the current control frame.
+- `rtsp_frame_lag`
+  - How many frames the RTSP branch is behind the current control frame.
+- `tracker_to_video_queue_ms`
+  - Age gap from current tracker/control timing to the latest observed downstream video queue frame.
+- `tracker_to_osd_ms`
+  - Age gap from current tracker/control timing to the latest observed OSD/output frame.
+
+Practical meaning:
+
+- Low `ds_to_py_ms` means the control branch is getting fresh metadata quickly.
+- Nonzero `display_frame_lag` or `rtsp_frame_lag` is acceptable if the video branch falls a little behind.
+- The important goal is that control stays fresh even when preview/RTSP is slower.
+
+The default simple full-run wrapper still writes `BRIDGE_STATE_FILE`, so you can inspect these timing fields after a bounded test.
 
 ## Stop / Restart
 

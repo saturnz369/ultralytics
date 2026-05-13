@@ -6,13 +6,21 @@ ROOT_DIR="${SCRIPT_DIR}"
 BIN_PATH="${ROOT_DIR}/deepstream_yolo26_rtsp_target_control"
 
 export SENSOR_ID="${SENSOR_ID:-0}"
-export CAMERA_WIDTH="${CAMERA_WIDTH:-1280}"
-export CAMERA_HEIGHT="${CAMERA_HEIGHT:-720}"
-export CAMERA_FPS_N="${CAMERA_FPS_N:-30}"
+export CAMERA_WIDTH="${CAMERA_WIDTH:-2028}"
+export CAMERA_HEIGHT="${CAMERA_HEIGHT:-1112}"
+export CAMERA_FPS_N="${CAMERA_FPS_N:-60}"
 export CAMERA_FPS_D="${CAMERA_FPS_D:-1}"
 export SHOW="${SHOW:-0}"
 export PRINT_FRAME_LOGS="${PRINT_FRAME_LOGS:-0}"
-export MAX_FRAMES="${MAX_FRAMES:-0}"
+export ALLOW_MAX_FRAMES="${ALLOW_MAX_FRAMES:-0}"
+if [[ "${ALLOW_MAX_FRAMES}" == "1" ]]; then
+  export MAX_FRAMES="${MAX_FRAMES:-0}"
+else
+  if [[ -n "${MAX_FRAMES+x}" && "${MAX_FRAMES}" != "0" ]]; then
+    echo "Ignoring inherited MAX_FRAMES=${MAX_FRAMES}; forcing unlimited run. Set ALLOW_MAX_FRAMES=1 to use bounded runs."
+  fi
+  export MAX_FRAMES=0
+fi
 export TARGET_CLASS_ID="${TARGET_CLASS_ID:-0}"
 export SELECTION="${SELECTION:-center}"
 export TARGET_ID="${TARGET_ID:--1}"
@@ -39,7 +47,7 @@ export STATE_FILE_FLUSH="${STATE_FILE_FLUSH:-0}"
 export RTSP_ENABLE="${RTSP_ENABLE:-1}"
 export RTSP_PORT="${RTSP_PORT:-8554}"
 export UDP_PORT="${UDP_PORT:-5400}"
-export BITRATE="${BITRATE:-4000000}"
+export BITRATE="${BITRATE:-8000000}"
 export VIDEO_QUEUE_BUFFERS="${VIDEO_QUEUE_BUFFERS:-2}"
 
 if [[ ! -x "${BIN_PATH}" ]]; then

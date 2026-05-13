@@ -1,0 +1,9 @@
+=============================================
+ Running E-CON Installation Script 
+ DATE : Thu May  7 18:12:40 KST 2026         
+=============================================
+Running this script as root
+continue ......
+Release checksum file missing ...
+Exitting ......
+Installation failed on prerequisites function at line no 1 with error code 1

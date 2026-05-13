@@ -17,17 +17,19 @@
 
 #include "gstnvdsmeta.h"
 
-#define DEFAULT_WIDTH 1280
-#define DEFAULT_HEIGHT 720
-#define DEFAULT_FPS_N 30
+#define DEFAULT_WIDTH 2028
+#define DEFAULT_HEIGHT 1112
+#define DEFAULT_FPS_N 60
 #define DEFAULT_FPS_D 1
 #define DEFAULT_TRACKER_WIDTH 960
 #define DEFAULT_TRACKER_HEIGHT 544
 #define DEFAULT_RTSP_PORT 8554
 #define DEFAULT_UDP_PORT 5400
-#define DEFAULT_RTSP_BITRATE 4000000
+#define DEFAULT_RTSP_BITRATE 8000000
+#define DEFAULT_RAW_RECORD_BITRATE 40000000
 #define DEFAULT_VIDEO_QUEUE_BUFFERS 2
 #define DEFAULT_RTSP_QUEUE_BUFFERS 4
+#define DEFAULT_RAW_RECORD_QUEUE_BUFFERS 8
 #define DEFAULT_RTSP_VIEWER_LATENCY_MS 80
 #define METADATA_IPC_MAGIC 0x5056324dU
 #define METADATA_IPC_VERSION 1U
@@ -69,10 +71,14 @@ typedef struct AppConfig {
   gint rtsp_port;
   gint udp_port;
   gint bitrate;
+  gboolean raw_record_enable;
+  gint raw_record_bitrate;
   gint video_queue_buffers;
   gint rtsp_queue_buffers;
+  gint raw_record_queue_buffers;
   gint rtsp_viewer_latency_ms;
   gchar *rtsp_mount;
+  gchar *raw_record_file;
   gchar *infer_config;
   gchar *tracker_config;
   gchar *metadata_ipc_file;
@@ -550,10 +556,14 @@ load_config(AppConfig *cfg)
   cfg->rtsp_port = env_int_default("RTSP_PORT", DEFAULT_RTSP_PORT);
   cfg->udp_port = env_int_default("UDP_PORT", DEFAULT_UDP_PORT);
   cfg->bitrate = env_int_default("BITRATE", DEFAULT_RTSP_BITRATE);
+  cfg->raw_record_enable = env_bool_default("RAW_RECORD_ENABLE", FALSE);
+  cfg->raw_record_bitrate = env_int_default("RAW_RECORD_BITRATE", DEFAULT_RAW_RECORD_BITRATE);
   cfg->video_queue_buffers = env_int_default("VIDEO_QUEUE_BUFFERS", DEFAULT_VIDEO_QUEUE_BUFFERS);
   cfg->rtsp_queue_buffers = env_int_default("RTSP_QUEUE_BUFFERS", DEFAULT_RTSP_QUEUE_BUFFERS);
+  cfg->raw_record_queue_buffers = env_int_default("RAW_RECORD_QUEUE_BUFFERS", DEFAULT_RAW_RECORD_QUEUE_BUFFERS);
   cfg->rtsp_viewer_latency_ms = env_int_default("RTSP_VIEWER_LATENCY_MS", DEFAULT_RTSP_VIEWER_LATENCY_MS);
   cfg->rtsp_mount = env_strdup_default("RTSP_MOUNT", "/ds-test");
+  cfg->raw_record_file = env_strdup_raw("RAW_RECORD_FILE");
   if (cfg->rtsp_mount[0] != '/') {
     gchar *fixed_mount = g_strdup_printf("/%s", cfg->rtsp_mount);
     g_free(cfg->rtsp_mount);
@@ -561,10 +571,10 @@ load_config(AppConfig *cfg)
   }
   cfg->infer_config = env_strdup_default(
       "INFER_CONFIG",
-      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/config/config_infer_primary_yolo26.txt");
+      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/config/config_infer_primary_yolo26.txt");
   cfg->tracker_config = env_strdup_default(
       "TRACKER_CONFIG",
-      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16/config/tracker_config.txt");
+      "/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/config/tracker_config.txt");
   cfg->metadata_ipc_file = env_strdup_raw("METADATA_IPC_FILE");
   cfg->state_file = env_strdup_raw("STATE_FILE");
   cfg->state_file_flush = env_bool_default("STATE_FILE_FLUSH", FALSE);
@@ -575,6 +585,7 @@ free_config(AppConfig *cfg)
 {
   g_free(cfg->selection);
   g_free(cfg->rtsp_mount);
+  g_free(cfg->raw_record_file);
   g_free(cfg->infer_config);
   g_free(cfg->tracker_config);
   g_free(cfg->metadata_ipc_file);
@@ -586,7 +597,7 @@ start_rtsp_streaming(AppState *state)
 {
   GstRTSPMountPoints *mounts = NULL;
   GstRTSPMediaFactory *factory = NULL;
-  gchar launch_desc[512];
+  gchar launch_desc[768];
   gchar port_str[32];
 
   if (!state->cfg.rtsp_enable) {
@@ -596,8 +607,11 @@ start_rtsp_streaming(AppState *state)
   g_snprintf(
       launch_desc,
       sizeof(launch_desc),
-      "( udpsrc name=pay0 port=%d buffer-size=%u caps=\"application/x-rtp, media=video, "
-      "clock-rate=90000, encoding-name=H264, payload=96\" )",
+      "( udpsrc port=%d buffer-size=%u caps=\"application/x-rtp, media=video, "
+      "clock-rate=90000, encoding-name=H264, payload=96\" "
+      "! rtph264depay "
+      "! h264parse config-interval=-1 "
+      "! rtph264pay name=pay0 pt=96 config-interval=1 mtu=1200 )",
       state->cfg.udp_port,
       512 * 1024);
   g_snprintf(port_str, sizeof(port_str), "%d", state->cfg.rtsp_port);
@@ -1671,12 +1685,16 @@ main(int argc, char *argv[])
   GstElement *source = NULL;
   GstElement *source_caps = NULL;
   GstElement *source_conv = NULL;
+  GstElement *source_tee = NULL;
+  GstElement *source_mux_queue = NULL;
   GstElement *streammux = NULL;
   GstElement *pgie = NULL;
   GstElement *nvtracker = NULL;
   GstElement *video_queue = NULL;
+  GstElement *preosd_tee = NULL;
   GstElement *tee = NULL;
   GstElement *display_conv = NULL;
+  GstElement *osd_queue = NULL;
   GstElement *display_osd = NULL;
   GstElement *display_queue = NULL;
   GstElement *rtsp_queue = NULL;
@@ -1686,23 +1704,38 @@ main(int argc, char *argv[])
   GstElement *h264parse = NULL;
   GstElement *rtppay = NULL;
   GstElement *udpsink = NULL;
+  GstElement *raw_record_queue = NULL;
+  GstElement *raw_record_conv = NULL;
+  GstElement *raw_record_caps = NULL;
+  GstElement *raw_record_encoder = NULL;
+  GstElement *raw_record_parse = NULL;
+  GstElement *raw_record_mux = NULL;
+  GstElement *raw_record_sink = NULL;
   GstElement *sink = NULL;
   GstBus *bus = NULL;
   GstCaps *caps = NULL;
   GstCaps *encoder_caps = NULL;
+  GstCaps *raw_record_encoder_caps = NULL;
   gchar *caps_str = NULL;
   gchar *encoder_caps_str = NULL;
   GstPad *mux_sink_pad = NULL;
-  GstPad *source_src_pad = NULL;
+  GstPad *source_tee_infer_pad = NULL;
+  GstPad *source_tee_raw_pad = NULL;
+  GstPad *source_mux_queue_pad = NULL;
+  GstPad *source_mux_queue_src_pad = NULL;
+  GstPad *raw_record_queue_pad = NULL;
   /* ===== LATENCY STAGE 3 ADDED START ===== */
   GstPad *mux_src_pad = NULL;
   GstPad *pgie_src_pad = NULL;
   GstPad *video_queue_src_pad = NULL;
+  GstPad *osd_queue_src_pad = NULL;
   GstPad *nvosd_src_pad = NULL;
   GstPad *display_queue_src_pad = NULL;
   GstPad *rtsp_queue_src_pad = NULL;
   /* ===== LATENCY STAGE 3 ADDED END ===== */
   GstPad *tracker_src_pad = NULL;
+  GstPad *preosd_osd_pad = NULL;
+  GstPad *osd_queue_pad = NULL;
   GstPad *tee_display_pad = NULL;
   GstPad *tee_rtsp_pad = NULL;
   GstPad *display_queue_pad = NULL;
@@ -1713,6 +1746,12 @@ main(int argc, char *argv[])
   g_mutex_init(&state.latency_stage3_branch_lock);
   g_mutex_init(&state.frame_snapshot_lock);
   load_config(&state.cfg);
+  if (state.cfg.raw_record_enable &&
+      (!state.cfg.raw_record_file || !*state.cfg.raw_record_file)) {
+    g_printerr("RAW_RECORD_ENABLE=1 requires RAW_RECORD_FILE to be set.\n");
+    free_config(&state.cfg);
+    return 1;
+  }
 
   gst_init(NULL, NULL);
   state.loop = g_main_loop_new(NULL, FALSE);
@@ -1721,11 +1760,15 @@ main(int argc, char *argv[])
   source = gst_element_factory_make("nvarguscamerasrc", "csi-source");
   source_caps = gst_element_factory_make("capsfilter", "source-caps");
   source_conv = gst_element_factory_make("nvvideoconvert", "source-convert");
+  source_tee = gst_element_factory_make("tee", "source-tee");
+  source_mux_queue = gst_element_factory_make("queue", "source-mux-queue");
   streammux = gst_element_factory_make("nvstreammux", "stream-muxer");
   pgie = gst_element_factory_make("nvinfer", "primary-infer");
   nvtracker = gst_element_factory_make("nvtracker", "tracker");
   video_queue = gst_element_factory_make("queue", "video-queue");
+  preosd_tee = gst_element_factory_make("tee", "preosd-tee");
   display_conv = gst_element_factory_make("nvvideoconvert", "video-convert");
+  osd_queue = gst_element_factory_make("queue", "osd-queue");
   display_osd = gst_element_factory_make("nvdsosd", "osd");
   tee = gst_element_factory_make("tee", "branch-tee");
   display_queue = gst_element_factory_make("queue", "display-queue");
@@ -1740,13 +1783,26 @@ main(int argc, char *argv[])
     rtppay = gst_element_factory_make("rtph264pay", "rtsp-payloader");
     udpsink = gst_element_factory_make("udpsink", "rtsp-udpsink");
   }
+  if (state.cfg.raw_record_enable) {
+    raw_record_queue = gst_element_factory_make("queue", "raw-record-queue");
+    raw_record_conv = gst_element_factory_make("nvvideoconvert", "raw-record-convert");
+    raw_record_caps = gst_element_factory_make("capsfilter", "raw-record-caps");
+    raw_record_encoder = gst_element_factory_make("nvv4l2h264enc", "raw-record-encoder");
+    raw_record_parse = gst_element_factory_make("h264parse", "raw-record-h264parse");
+    raw_record_mux = gst_element_factory_make("matroskamux", "raw-record-mux");
+    raw_record_sink = gst_element_factory_make("filesink", "raw-record-sink");
+  }
 
-  if (!pipeline || !source || !source_caps || !source_conv || !streammux || !pgie || !nvtracker ||
-      !video_queue ||
-      !tee || !display_queue || !display_conv || !display_osd || !sink ||
+  if (!pipeline || !source || !source_caps || !source_conv || !source_tee || !source_mux_queue ||
+      !streammux || !pgie || !nvtracker ||
+      !video_queue || !preosd_tee ||
+      !tee || !display_queue || !display_conv || !osd_queue || !display_osd || !sink ||
       (state.cfg.rtsp_enable &&
        (!rtsp_queue || !rtsp_postconv || !rtsp_caps ||
-        !encoder || !h264parse || !rtppay || !udpsink))) {
+        !encoder || !h264parse || !rtppay || !udpsink)) ||
+      (state.cfg.raw_record_enable &&
+       (!raw_record_queue || !raw_record_conv || !raw_record_caps ||
+        !raw_record_encoder || !raw_record_parse || !raw_record_mux || !raw_record_sink))) {
     g_printerr("Failed to create one or more GStreamer elements.\n");
     free_config(&state.cfg);
     return 1;
@@ -1784,6 +1840,11 @@ main(int argc, char *argv[])
 
   g_object_set(G_OBJECT(source), "sensor-id", state.cfg.sensor_id, NULL);
   g_object_set(G_OBJECT(source_caps), "caps", caps, NULL);
+  g_object_set(G_OBJECT(source_mux_queue),
+               "max-size-buffers", 4,
+               "max-size-bytes", 0,
+               "max-size-time", 0,
+               NULL);
   g_object_set(G_OBJECT(streammux),
                "width", state.cfg.width,
                "height", state.cfg.height,
@@ -1807,6 +1868,12 @@ main(int argc, char *argv[])
   g_object_set(G_OBJECT(video_queue),
                "leaky", 2,
                "max-size-buffers", MAX(1, state.cfg.video_queue_buffers),
+               "max-size-bytes", 0,
+               "max-size-time", 0,
+               NULL);
+  g_object_set(G_OBJECT(osd_queue),
+               "leaky", 2,
+               "max-size-buffers", 2,
                "max-size-bytes", 0,
                "max-size-time", 0,
                NULL);
@@ -1839,28 +1906,82 @@ main(int argc, char *argv[])
                  "sync", FALSE,
                  NULL);
   }
+  if (state.cfg.raw_record_enable) {
+    encoder_caps_str = g_strdup("video/x-raw(memory:NVMM), format=(string)I420");
+    raw_record_encoder_caps = gst_caps_from_string(encoder_caps_str);
+    g_free(encoder_caps_str);
+    g_object_set(G_OBJECT(raw_record_caps), "caps", raw_record_encoder_caps, NULL);
+    g_object_set(G_OBJECT(raw_record_queue),
+                 "leaky", 2,
+                 "max-size-buffers", MAX(1, state.cfg.raw_record_queue_buffers),
+                 "max-size-bytes", 0,
+                 "max-size-time", 0,
+                 NULL);
+    g_object_set(G_OBJECT(raw_record_encoder),
+                 "bitrate", state.cfg.raw_record_bitrate,
+                 "control-rate", 1,
+                 "preset-level", 1,
+                 "maxperf-enable", TRUE,
+                 "iframeinterval", 15,
+                 "idrinterval", 15,
+                 "insert-sps-pps", TRUE,
+                 "insert-vui", TRUE,
+                 NULL);
+    g_object_set(G_OBJECT(raw_record_sink),
+                 "location", state.cfg.raw_record_file,
+                 "sync", FALSE,
+                 NULL);
+  }
 
   gst_bin_add_many(GST_BIN(pipeline),
-                   source, source_caps, source_conv, streammux, pgie, nvtracker, video_queue,
-                   display_conv, display_osd, tee, display_queue, sink, NULL);
+                   source, source_caps, source_conv, source_tee, source_mux_queue,
+                   streammux, pgie, nvtracker, video_queue,
+                   display_conv, preosd_tee, osd_queue, display_osd, tee, display_queue, sink, NULL);
   if (state.cfg.rtsp_enable) {
     gst_bin_add_many(GST_BIN(pipeline),
                      rtsp_queue, rtsp_postconv, rtsp_caps, encoder, h264parse, rtppay, udpsink, NULL);
   }
+  if (state.cfg.raw_record_enable) {
+    gst_bin_add_many(GST_BIN(pipeline),
+                     raw_record_queue, raw_record_conv, raw_record_caps,
+                     raw_record_encoder, raw_record_parse, raw_record_mux, raw_record_sink, NULL);
+  }
 
-  if (!gst_element_link_many(source, source_caps, source_conv, NULL)) {
+  if (!gst_element_link_many(source, source_caps, source_conv, source_tee, NULL)) {
     g_printerr("Failed to link source chain.\n");
     goto cleanup;
   }
 
-  source_src_pad = gst_element_get_static_pad(source_conv, "src");
+  source_tee_infer_pad = gst_element_get_request_pad(source_tee, "src_%u");
+  source_mux_queue_pad = gst_element_get_static_pad(source_mux_queue, "sink");
+  source_mux_queue_src_pad = gst_element_get_static_pad(source_mux_queue, "src");
   mux_sink_pad = gst_element_get_request_pad(streammux, "sink_0");
-  if (!source_src_pad || !mux_sink_pad || gst_pad_link(source_src_pad, mux_sink_pad) != GST_PAD_LINK_OK) {
-    g_printerr("Failed to link source converter to streammux.\n");
+  if (state.cfg.raw_record_enable) {
+    source_tee_raw_pad = gst_element_get_request_pad(source_tee, "src_%u");
+    raw_record_queue_pad = gst_element_get_static_pad(raw_record_queue, "sink");
+  }
+  if (!source_tee_infer_pad || !source_mux_queue_pad || !source_mux_queue_src_pad || !mux_sink_pad ||
+      (state.cfg.raw_record_enable && (!source_tee_raw_pad || !raw_record_queue_pad)) ||
+      gst_pad_link(source_tee_infer_pad, source_mux_queue_pad) != GST_PAD_LINK_OK) {
+    g_printerr("Failed to link source tee to streammux/raw-record.\n");
+    goto cleanup;
+  }
+  if (state.cfg.raw_record_enable &&
+      gst_pad_link(source_tee_raw_pad, raw_record_queue_pad) != GST_PAD_LINK_OK) {
+    g_printerr("Failed to link source tee to raw-record branch.\n");
+    goto cleanup;
+  }
+  if (gst_pad_link(source_mux_queue_src_pad, mux_sink_pad) != GST_PAD_LINK_OK) {
+    g_printerr("Failed to link source-mux queue to streammux.\n");
     goto cleanup;
   }
 
-  if (!gst_element_link_many(streammux, pgie, nvtracker, video_queue, display_conv, display_osd, tee, NULL)) {
+  if (!gst_element_link_many(streammux, pgie, nvtracker, video_queue, preosd_tee, NULL)) {
+    g_printerr("Failed to link inference/tracker/pre-OSD chain.\n");
+    goto cleanup;
+  }
+
+  if (!gst_element_link_many(osd_queue, display_conv, display_osd, tee, NULL)) {
     g_printerr("Failed to link inference/tracker/tee chain.\n");
     goto cleanup;
   }
@@ -1875,6 +1996,24 @@ main(int argc, char *argv[])
       g_printerr("Failed to link RTSP branch.\n");
       goto cleanup;
     }
+  }
+  if (state.cfg.raw_record_enable) {
+    if (!gst_element_link_many(raw_record_queue, raw_record_conv, raw_record_caps,
+                               raw_record_encoder, raw_record_parse, raw_record_mux, raw_record_sink, NULL)) {
+      g_printerr("Failed to link raw-record branch.\n");
+      goto cleanup;
+    }
+  }
+
+  preosd_osd_pad = gst_element_get_request_pad(preosd_tee, "src_%u");
+  osd_queue_pad = gst_element_get_static_pad(osd_queue, "sink");
+  if (!preosd_osd_pad || !osd_queue_pad) {
+    g_printerr("Failed to get pre-OSD tee branch pads.\n");
+    goto cleanup;
+  }
+  if (gst_pad_link(preosd_osd_pad, osd_queue_pad) != GST_PAD_LINK_OK) {
+    g_printerr("Failed to link pre-OSD tee to OSD branch.\n");
+    goto cleanup;
   }
 
   tee_display_pad = gst_element_get_request_pad(tee, "src_%u");
@@ -1904,6 +2043,7 @@ main(int argc, char *argv[])
   mux_src_pad = gst_element_get_static_pad(streammux, "src");
   pgie_src_pad = gst_element_get_static_pad(pgie, "src");
   video_queue_src_pad = gst_element_get_static_pad(video_queue, "src");
+  osd_queue_src_pad = gst_element_get_static_pad(osd_queue, "src");
   nvosd_src_pad = gst_element_get_static_pad(display_osd, "src");
   display_queue_src_pad = gst_element_get_static_pad(display_queue, "src");
   if (state.cfg.rtsp_enable) {
@@ -1920,10 +2060,14 @@ main(int argc, char *argv[])
     g_printerr("Warning: failed to get pgie src pad for latency stage 3.\n");
   }
   if (video_queue_src_pad) {
-    gst_pad_add_probe(video_queue_src_pad, GST_PAD_PROBE_TYPE_BUFFER, video_overlay_pad_buffer_probe, &state, NULL);
     gst_pad_add_probe(video_queue_src_pad, GST_PAD_PROBE_TYPE_BUFFER, latency_stage3_video_queue_src_probe, &state, NULL);
   } else {
     g_printerr("Warning: failed to get video-queue src pad for latency stage 3.\n");
+  }
+  if (osd_queue_src_pad) {
+    gst_pad_add_probe(osd_queue_src_pad, GST_PAD_PROBE_TYPE_BUFFER, video_overlay_pad_buffer_probe, &state, NULL);
+  } else {
+    g_printerr("Warning: failed to get osd-queue src pad for overlay probe.\n");
   }
   if (nvosd_src_pad) {
     gst_pad_add_probe(nvosd_src_pad, GST_PAD_PROBE_TYPE_BUFFER, latency_stage3_nvosd_src_probe, &state, NULL);
@@ -1973,6 +2117,9 @@ main(int argc, char *argv[])
   } else {
     g_print("RTSP disabled for this run.\n");
   }
+  if (state.cfg.raw_record_enable) {
+    g_print("Raw pre-OSD recording: %s\n", state.cfg.raw_record_file);
+  }
 
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
   g_main_loop_run(state.loop);
@@ -1991,6 +2138,9 @@ cleanup:
   if (video_queue_src_pad) {
     gst_object_unref(video_queue_src_pad);
   }
+  if (osd_queue_src_pad) {
+    gst_object_unref(osd_queue_src_pad);
+  }
   if (nvosd_src_pad) {
     gst_object_unref(nvosd_src_pad);
   }
@@ -2004,6 +2154,27 @@ cleanup:
   if (tracker_src_pad) {
     gst_object_unref(tracker_src_pad);
   }
+  if (source_tee_infer_pad) {
+    gst_object_unref(source_tee_infer_pad);
+  }
+  if (source_tee_raw_pad) {
+    gst_object_unref(source_tee_raw_pad);
+  }
+  if (source_mux_queue_pad) {
+    gst_object_unref(source_mux_queue_pad);
+  }
+  if (source_mux_queue_src_pad) {
+    gst_object_unref(source_mux_queue_src_pad);
+  }
+  if (preosd_osd_pad) {
+    gst_object_unref(preosd_osd_pad);
+  }
+  if (osd_queue_pad) {
+    gst_object_unref(osd_queue_pad);
+  }
+  if (raw_record_queue_pad) {
+    gst_object_unref(raw_record_queue_pad);
+  }
   if (tee_display_pad) {
     gst_object_unref(tee_display_pad);
   }
@@ -2016,9 +2187,6 @@ cleanup:
   if (rtsp_queue_pad) {
     gst_object_unref(rtsp_queue_pad);
   }
-  if (source_src_pad) {
-    gst_object_unref(source_src_pad);
-  }
   if (mux_sink_pad) {
     gst_object_unref(mux_sink_pad);
   }
@@ -2027,6 +2195,9 @@ cleanup:
   }
   if (encoder_caps) {
     gst_caps_unref(encoder_caps);
+  }
+  if (raw_record_encoder_caps) {
+    gst_caps_unref(raw_record_encoder_caps);
   }
   if (pipeline) {
     gst_element_set_state(pipeline, GST_STATE_NULL);
