@@ -4,6 +4,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+INFER_CONFIG="${INFER_CONFIG:-${SCRIPT_DIR}/config/config_infer_primary_yolo26.txt}"
+TRACKER_CONFIG="${TRACKER_CONFIG:-${SCRIPT_DIR}/config/tracker_config.txt}"
+
+yaml_quote() {
+    local value="${1:-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '"%s"' "${value}"
+}
+
+infer_cfg_value() {
+    local key="$1"
+    local path="$2"
+    [[ -f "${path}" ]] || return 0
+    grep -m1 "^${key}=" "${path}" 2>/dev/null | cut -d'=' -f2-
+}
 
 PYTHON_BIN="${PYTHON_BIN:-/home/saturnzzz/DeepStream-Yolo/.venv-yolo26-sys/bin/python}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -26,6 +42,7 @@ CAMERA_WIDTH="${CAMERA_WIDTH:-2028}"
 CAMERA_HEIGHT="${CAMERA_HEIGHT:-1112}"
 CAMERA_FPS_N="${CAMERA_FPS_N:-60}"
 CAMERA_FPS_D="${CAMERA_FPS_D:-1}"
+METADATA_MAX_AGE_MS="${METADATA_MAX_AGE_MS:-150}"
 SHOW="${SHOW:-0}"
 PRINT_FRAME_LOGS="${PRINT_FRAME_LOGS:-0}"
 TARGET_CLASS_ID="${TARGET_CLASS_ID:-0}"
@@ -102,6 +119,123 @@ DRY_RUN_MAVLINK="${DRY_RUN_MAVLINK:-0}"
 CONTROL_API="${CONTROL_API:-command}"
 PRINT_STATE="${PRINT_STATE:-0}"
 BRIDGE_STATE_FILE="${BRIDGE_STATE_FILE:-}"
+PRINT_HEALTH="${PRINT_HEALTH:-0}"
+HEALTH_PRINT_INTERVAL_SEC="${HEALTH_PRINT_INTERVAL_SEC:-1.0}"
+HEALTH_STATE_FILE="${HEALTH_STATE_FILE:-}"
+HEALTH_TEMP_ZONE="${HEALTH_TEMP_ZONE:-tj-thermal}"
+RUN_ARTIFACTS_ENABLE="${RUN_ARTIFACTS_ENABLE:-1}"
+RUNS_ROOT="${RUNS_ROOT:-${SCRIPT_DIR}/runs}"
+RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
+RUN_DIR=""
+CONFIG_USED_FILE=""
+PERFORMANCE_SUMMARY_FILE=""
+
+if [[ "${RUN_ARTIFACTS_ENABLE}" == "1" ]]; then
+    RUN_DIR="${RUNS_ROOT}/${RUN_TAG}"
+    mkdir -p "${RUN_DIR}"
+
+    if [[ -z "${BRIDGE_STATE_FILE}" ]]; then
+        BRIDGE_STATE_FILE="${RUN_DIR}/detection_log.jsonl"
+    fi
+    if [[ -z "${HEALTH_STATE_FILE}" ]]; then
+        HEALTH_STATE_FILE="${RUN_DIR}/health_log.jsonl"
+    fi
+    if [[ -z "${DEEPSTREAM_LOG_FILE}" ]]; then
+        DEEPSTREAM_LOG_FILE="${RUN_DIR}/deepstream.log"
+    fi
+    if [[ "${RAW_RECORD_ENABLE}" == "1" && -z "${RAW_RECORD_FILE}" ]]; then
+        RAW_RECORD_FILE="${RUN_DIR}/recording_clean.mkv"
+    fi
+
+    CONFIG_USED_FILE="${RUN_DIR}/config_used.yaml"
+    PERFORMANCE_SUMMARY_FILE="${RUN_DIR}/performance_summary.txt"
+
+    GIT_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+    GIT_BRANCH="$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    GIT_DIRTY_COUNT="$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    [[ -z "${GIT_DIRTY_COUNT}" ]] && GIT_DIRTY_COUNT="0"
+    NV_TEGRA_RELEASE="$(cat /etc/nv_tegra_release 2>/dev/null || echo unknown)"
+    UNAME_TEXT="$(uname -a 2>/dev/null || echo unknown)"
+    NVMODEL_TEXT="$(nvpmodel -q 2>/dev/null | tr '\n' ';' || echo unknown)"
+
+    MODEL_ENGINE_FILE="$(infer_cfg_value "model-engine-file" "${INFER_CONFIG:-}")"
+    ONNX_FILE="$(infer_cfg_value "onnx-file" "${INFER_CONFIG:-}")"
+    LABEL_FILE="$(infer_cfg_value "labelfile-path" "${INFER_CONFIG:-}")"
+    CONF_THRESHOLD="$(infer_cfg_value "pre-cluster-threshold" "${INFER_CONFIG:-}")"
+
+    {
+        echo "run_tag: $(yaml_quote "${RUN_TAG}")"
+        echo "run_dir: $(yaml_quote "${RUN_DIR}")"
+        echo "timestamp_local: $(yaml_quote "$(date '+%Y-%m-%d %H:%M:%S %z')")"
+        echo "git_commit: $(yaml_quote "${GIT_COMMIT}")"
+        echo "git_branch: $(yaml_quote "${GIT_BRANCH}")"
+        echo "git_dirty_files: ${GIT_DIRTY_COUNT}"
+        echo "jetson_info:"
+        echo "  nv_tegra_release: $(yaml_quote "${NV_TEGRA_RELEASE}")"
+        echo "  uname: $(yaml_quote "${UNAME_TEXT}")"
+        echo "  nvpmodel: $(yaml_quote "${NVMODEL_TEXT}")"
+        echo "camera:"
+        echo "  sensor_id: ${SENSOR_ID}"
+        echo "  width: ${CAMERA_WIDTH}"
+        echo "  height: ${CAMERA_HEIGHT}"
+        echo "  fps_n: ${CAMERA_FPS_N}"
+        echo "  fps_d: ${CAMERA_FPS_D}"
+        echo "model:"
+        echo "  infer_config: $(yaml_quote "${INFER_CONFIG:-}")"
+        echo "  model_engine_file: $(yaml_quote "${MODEL_ENGINE_FILE}")"
+        echo "  onnx_file: $(yaml_quote "${ONNX_FILE}")"
+        echo "  labels_file: $(yaml_quote "${LABEL_FILE}")"
+        echo "  confidence_threshold: $(yaml_quote "${CONF_THRESHOLD}")"
+        echo "tracker:"
+        echo "  tracker_config: $(yaml_quote "${TRACKER_CONFIG:-}")"
+        echo "selection:"
+        echo "  target_class_id: ${TARGET_CLASS_ID}"
+        echo "  selection: $(yaml_quote "${SELECTION}")"
+        echo "  target_id: $(yaml_quote "${TARGET_ID}")"
+        echo "control:"
+        echo "  metadata_max_age_ms: ${METADATA_MAX_AGE_MS}"
+        echo "  lost_buffer: ${LOST_BUFFER}"
+        echo "  pan_gain: ${PAN_GAIN}"
+        echo "  tilt_gain: ${TILT_GAIN}"
+        echo "  deadzone: ${DEADZONE}"
+        echo "  smooth_alpha: ${SMOOTH_ALPHA}"
+        echo "  fast_smooth_alpha: ${FAST_SMOOTH_ALPHA}"
+        echo "  fast_error_zone: ${FAST_ERROR_ZONE}"
+        echo "  command_boost_zone: ${COMMAND_BOOST_ZONE}"
+        echo "  min_active_command: ${MIN_ACTIVE_COMMAND}"
+        echo "  response_gamma: ${RESPONSE_GAMMA}"
+        echo "  pan_feedforward_gain: ${PAN_FEEDFORWARD_GAIN}"
+        echo "  tilt_feedforward_gain: ${TILT_FEEDFORWARD_GAIN}"
+        echo "  feedforward_alpha: ${FEEDFORWARD_ALPHA}"
+        echo "  feedforward_limit: ${FEEDFORWARD_LIMIT}"
+        echo "  feedforward_activation_zone: ${FEEDFORWARD_ACTIVATION_ZONE}"
+        echo "  max_command: ${MAX_COMMAND}"
+        echo "  send_rate_hz: ${SEND_RATE_HZ}"
+        echo "  max_yaw_rate_dps: ${MAX_YAW_RATE_DPS}"
+        echo "  max_pitch_rate_dps: ${MAX_PITCH_RATE_DPS}"
+        echo "mavlink:"
+        echo "  serial_device: $(yaml_quote "${SERIAL_DEVICE}")"
+        echo "  serial_baud: ${SERIAL_BAUD}"
+        echo "  target_system: ${MAV_TARGET_SYSTEM}"
+        echo "  target_component: ${MAV_TARGET_COMPONENT}"
+        echo "  gimbal_device_id: ${GIMBAL_DEVICE_ID}"
+        echo "runtime:"
+        echo "  show: ${SHOW}"
+        echo "  rtsp_enable: ${RTSP_ENABLE}"
+        echo "  rtsp_port: ${RTSP_PORT}"
+        echo "  rtsp_mount: $(yaml_quote "${RTSP_MOUNT}")"
+        echo "  raw_record_enable: ${RAW_RECORD_ENABLE}"
+        echo "  raw_record_file: $(yaml_quote "${RAW_RECORD_FILE}")"
+        echo "artifacts:"
+        echo "  bridge_state_file: $(yaml_quote "${BRIDGE_STATE_FILE}")"
+        echo "  health_state_file: $(yaml_quote "${HEALTH_STATE_FILE}")"
+        echo "  deepstream_log_file: $(yaml_quote "${DEEPSTREAM_LOG_FILE}")"
+        echo "  config_used_file: $(yaml_quote "${CONFIG_USED_FILE}")"
+        echo "  performance_summary_file: $(yaml_quote "${PERFORMANCE_SUMMARY_FILE}")"
+    } > "${CONFIG_USED_FILE}"
+
+    ln -sfn "${RUN_DIR}" "${RUNS_ROOT}/latest"
+fi
 
 CMD=(
     "${PYTHON_BIN}"
@@ -164,12 +298,23 @@ fi
 if [[ "${PRINT_STATE}" == "1" ]]; then
     CMD+=(--print-state)
 fi
+if [[ "${PRINT_HEALTH}" == "1" ]]; then
+    CMD+=(--print-health)
+fi
+CMD+=(--health-print-interval-sec "${HEALTH_PRINT_INTERVAL_SEC}")
+if [[ -n "${HEALTH_STATE_FILE}" ]]; then
+    CMD+=(--health-state-file "${HEALTH_STATE_FILE}")
+fi
+if [[ -n "${HEALTH_TEMP_ZONE}" ]]; then
+    CMD+=(--health-temp-zone "${HEALTH_TEMP_ZONE}")
+fi
 
 export SENSOR_ID
 export CAMERA_WIDTH
 export CAMERA_HEIGHT
 export CAMERA_FPS_N
 export CAMERA_FPS_D
+export METADATA_MAX_AGE_MS
 export SHOW
 export PRINT_FRAME_LOGS
 export TARGET_CLASS_ID
@@ -191,6 +336,8 @@ export FEEDFORWARD_ALPHA
 export FEEDFORWARD_LIMIT
 export FEEDFORWARD_ACTIVATION_ZONE
 export MAX_COMMAND
+export INFER_CONFIG
+export TRACKER_CONFIG
 export INVERT_PAN
 export INVERT_TILT
 export RTSP_ENABLE
@@ -206,6 +353,36 @@ export RTSP_QUEUE_BUFFERS
 export RAW_RECORD_QUEUE_BUFFERS
 export MAX_FRAMES
 export STATE_FILE_FLUSH
+export PRINT_HEALTH
+export HEALTH_PRINT_INTERVAL_SEC
+export HEALTH_STATE_FILE
+export HEALTH_TEMP_ZONE
+export RUN_ARTIFACTS_ENABLE
+export RUNS_ROOT
+export RUN_TAG
 
 cd "${REPO_ROOT}"
-exec "${CMD[@]}" "$@"
+if "${CMD[@]}" "$@"; then
+    RUN_RC=0
+else
+    RUN_RC=$?
+fi
+
+if [[ "${RUN_ARTIFACTS_ENABLE}" == "1" && -n "${PERFORMANCE_SUMMARY_FILE}" ]]; then
+    {
+        echo "run_dir=${RUN_DIR}"
+        echo "run_exit_code=${RUN_RC}"
+        echo "bridge_state_file=${BRIDGE_STATE_FILE}"
+        echo "health_state_file=${HEALTH_STATE_FILE}"
+        echo "deepstream_log_file=${DEEPSTREAM_LOG_FILE}"
+        [[ -n "${RAW_RECORD_FILE}" ]] && echo "raw_record_file=${RAW_RECORD_FILE}"
+        echo
+        if [[ -n "${BRIDGE_STATE_FILE}" && -f "${BRIDGE_STATE_FILE}" ]]; then
+            python3 "${SCRIPT_DIR}/tools/bridge_latency_report.py" --bridge-log "${BRIDGE_STATE_FILE}" || true
+        else
+            echo "bridge_latency_report: bridge log not found"
+        fi
+    } > "${PERFORMANCE_SUMMARY_FILE}"
+fi
+
+exit "${RUN_RC}"

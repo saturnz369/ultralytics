@@ -32,7 +32,7 @@
 #define DEFAULT_RAW_RECORD_QUEUE_BUFFERS 8
 #define DEFAULT_RTSP_VIEWER_LATENCY_MS 80
 #define METADATA_IPC_MAGIC 0x5056324dU
-#define METADATA_IPC_VERSION 1U
+#define METADATA_IPC_VERSION 3U
 #define METADATA_IPC_PAYLOAD_MAX 8192U
 #define MAX_CANDIDATES 256
 #define FRAME_SNAPSHOT_RING_SIZE 512
@@ -77,6 +77,7 @@ typedef struct AppConfig {
   gint rtsp_queue_buffers;
   gint raw_record_queue_buffers;
   gint rtsp_viewer_latency_ms;
+  gboolean monitoring_errors_fatal;
   gchar *rtsp_mount;
   gchar *raw_record_file;
   gchar *infer_config;
@@ -170,6 +171,40 @@ typedef struct MetadataIpcRegion {
 } MetadataIpcRegion;
 
 G_STATIC_ASSERT(sizeof(MetadataIpcRegion) == 48 + METADATA_IPC_PAYLOAD_MAX);
+
+typedef struct _MetadataIpcPayload {
+  gint64 c_probe_start_mono_ns;
+  gint64 c_control_done_mono_ns;
+  gint64 mux_src_mono_ns;
+  gint64 pgie_src_mono_ns;
+  gint64 tracker_src_mono_ns;
+  guint64 frame_pts_ns;
+  guint64 frame_ntp_ns;
+  guint32 video_queue_frame_idx;
+  gint64 video_queue_src_mono_ns;
+  guint32 nvosd_frame_idx;
+  gint64 nvosd_src_mono_ns;
+  guint32 display_queue_frame_idx;
+  gint64 display_queue_src_mono_ns;
+  guint32 rtsp_queue_frame_idx;
+  gint64 rtsp_queue_src_mono_ns;
+  guint32 visible_tracks;
+  guint32 lost_frames;
+  guint8 has_target;
+  guint8 reserved0[7];
+  guint64 target_id;
+  gint32 class_id;
+  guint32 reserved1;
+  gdouble confidence;
+  gdouble dx_norm;
+  gdouble dy_norm;
+  gchar class_name[64];
+  gchar status[32];
+  gchar command_status[32];
+} __attribute__((__packed__)) MetadataIpcPayload;
+
+G_STATIC_ASSERT(sizeof(MetadataIpcPayload) == 288);
+G_STATIC_ASSERT(sizeof(MetadataIpcPayload) <= METADATA_IPC_PAYLOAD_MAX);
 
 typedef struct _Mk15RTSPClient Mk15RTSPClient;
 typedef struct _Mk15RTSPClientClass Mk15RTSPClientClass;
@@ -562,6 +597,7 @@ load_config(AppConfig *cfg)
   cfg->rtsp_queue_buffers = env_int_default("RTSP_QUEUE_BUFFERS", DEFAULT_RTSP_QUEUE_BUFFERS);
   cfg->raw_record_queue_buffers = env_int_default("RAW_RECORD_QUEUE_BUFFERS", DEFAULT_RAW_RECORD_QUEUE_BUFFERS);
   cfg->rtsp_viewer_latency_ms = env_int_default("RTSP_VIEWER_LATENCY_MS", DEFAULT_RTSP_VIEWER_LATENCY_MS);
+  cfg->monitoring_errors_fatal = env_bool_default("MONITORING_ERRORS_FATAL", FALSE);
   cfg->rtsp_mount = env_strdup_default("RTSP_MOUNT", "/ds-test");
   cfg->raw_record_file = env_strdup_raw("RAW_RECORD_FILE");
   if (cfg->rtsp_mount[0] != '/') {
@@ -634,6 +670,26 @@ start_rtsp_streaming(AppState *state)
 }
 
 static gboolean
+is_disposable_branch_element_name(const gchar *name)
+{
+  if (!name || !*name) {
+    return FALSE;
+  }
+
+  return g_str_equal(name, "video-queue") ||
+         g_str_equal(name, "preosd-tee") ||
+         g_str_equal(name, "video-convert") ||
+         g_str_equal(name, "osd-queue") ||
+         g_str_equal(name, "osd") ||
+         g_str_equal(name, "branch-tee") ||
+         g_str_equal(name, "display-queue") ||
+         g_str_equal(name, "display") ||
+         g_str_equal(name, "fakesink") ||
+         g_str_has_prefix(name, "rtsp-") ||
+         g_str_has_prefix(name, "raw-record-");
+}
+
+static gboolean
 bus_call(GstBus *bus, GstMessage *msg, gpointer data)
 {
   (void) bus;
@@ -646,7 +702,19 @@ bus_call(GstBus *bus, GstMessage *msg, gpointer data)
     case GST_MESSAGE_ERROR: {
       GError *error = NULL;
       gchar *debug = NULL;
+      const gchar *src_name = GST_OBJECT_NAME(msg->src);
       gst_message_parse_error(msg, &error, &debug);
+      if (!state->cfg.monitoring_errors_fatal && is_disposable_branch_element_name(src_name)) {
+        g_printerr("WARNING disposable video branch error from %s: %s\n",
+                   src_name ? src_name : "(unknown)",
+                   error ? error->message : "unknown error");
+        if (debug) {
+          g_printerr("Details: %s\n", debug);
+        }
+        g_clear_error(&error);
+        g_free(debug);
+        break;
+      }
       g_printerr("ERROR from %s: %s\n", GST_OBJECT_NAME(msg->src), error->message);
       if (debug) {
         g_printerr("Details: %s\n", debug);
@@ -1152,6 +1220,8 @@ format_state_json(char *buf,
                   gsize buf_size,
                   guint frame_idx,
                   gint64 ds_write_mono_ns,
+                  guint64 frame_pts_ns,
+                  guint64 frame_ntp_ns,
                   /* ===== LATENCY STAGE 2/3 ADDED START ===== */
                   gint64 c_probe_start_mono_ns,
                   gint64 c_control_done_mono_ns,
@@ -1190,6 +1260,8 @@ format_state_json(char *buf,
       (written < (gint) buf_size) ? buf_size - (gsize) written : 0,
       "{\"frame_idx\":%u,"
       "\"ds_write_mono_ns\":%" G_GINT64_FORMAT ","
+      "\"frame_pts_ns\":%" G_GUINT64_FORMAT ","
+      "\"frame_ntp_ns\":%" G_GUINT64_FORMAT ","
       "\"c_probe_start_mono_ns\":%" G_GINT64_FORMAT ","
       "\"c_control_done_mono_ns\":%" G_GINT64_FORMAT ","
       "\"mux_src_mono_ns\":%" G_GINT64_FORMAT ","
@@ -1207,6 +1279,8 @@ format_state_json(char *buf,
       "\"lost_frames\":%u,\"target_id\":",
       frame_idx,
       ds_write_mono_ns,
+      frame_pts_ns,
+      frame_ntp_ns,
       c_probe_start_mono_ns,
       c_control_done_mono_ns,
       mux_src_mono_ns,
@@ -1313,6 +1387,8 @@ static void
 publish_metadata_ipc(AppState *state,
                      guint frame_idx,
                      gint64 ds_write_mono_ns,
+                     guint64 frame_pts_ns,
+                     guint64 frame_ntp_ns,
                      /* ===== LATENCY STAGE 2/3 ADDED START ===== */
                      gint64 c_probe_start_mono_ns,
                      gint64 c_control_done_mono_ns,
@@ -1341,8 +1417,12 @@ publish_metadata_ipc(AppState *state,
                      gdouble tilt_cmd)
 {
   MetadataIpcRegion *region = (MetadataIpcRegion *) state->metadata_ipc_map;
+  MetadataIpcPayload payload;
   guint64 start_seq = 0;
-  gsize payload_len = 0;
+  (void) smooth_dx;
+  (void) smooth_dy;
+  (void) pan_cmd;
+  (void) tilt_cmd;
 
   if (!region) {
     return;
@@ -1355,36 +1435,42 @@ publish_metadata_ipc(AppState *state,
   region->sequence = start_seq;
   __sync_synchronize();
 
-  payload_len = format_state_json(region->payload,
-                                  sizeof(region->payload),
-                                  frame_idx,
-                                  ds_write_mono_ns,
-                                  c_probe_start_mono_ns,
-                                  c_control_done_mono_ns,
-                                  mux_src_mono_ns,
-                                  pgie_src_mono_ns,
-                                  tracker_src_mono_ns,
-                                  video_queue_frame_idx,
-                                  video_queue_src_mono_ns,
-                                  nvosd_frame_idx,
-                                  nvosd_src_mono_ns,
-                                  display_queue_frame_idx,
-                                  display_queue_src_mono_ns,
-                                  rtsp_queue_frame_idx,
-                                  rtsp_queue_src_mono_ns,
-                                  status,
-                                  command_status,
-                                  visible_tracks,
-                                  lost_frames,
-                                  target,
-                                  dx_norm,
-                                  dy_norm,
-                                  smooth_dx,
-                                  smooth_dy,
-                                  pan_cmd,
-                                  tilt_cmd);
-  region->payload[payload_len] = '\0';
-  region->payload_len = (guint32) payload_len;
+  memset(&payload, 0, sizeof(payload));
+  payload.c_probe_start_mono_ns = c_probe_start_mono_ns;
+  payload.c_control_done_mono_ns = c_control_done_mono_ns;
+  payload.mux_src_mono_ns = mux_src_mono_ns;
+  payload.pgie_src_mono_ns = pgie_src_mono_ns;
+  payload.tracker_src_mono_ns = tracker_src_mono_ns;
+  payload.frame_pts_ns = frame_pts_ns;
+  payload.frame_ntp_ns = frame_ntp_ns;
+  payload.video_queue_frame_idx = video_queue_frame_idx;
+  payload.video_queue_src_mono_ns = video_queue_src_mono_ns;
+  payload.nvosd_frame_idx = nvosd_frame_idx;
+  payload.nvosd_src_mono_ns = nvosd_src_mono_ns;
+  payload.display_queue_frame_idx = display_queue_frame_idx;
+  payload.display_queue_src_mono_ns = display_queue_src_mono_ns;
+  payload.rtsp_queue_frame_idx = rtsp_queue_frame_idx;
+  payload.rtsp_queue_src_mono_ns = rtsp_queue_src_mono_ns;
+  payload.visible_tracks = visible_tracks;
+  payload.lost_frames = lost_frames;
+  payload.has_target = target ? 1U : 0U;
+  payload.class_id = target ? target->class_id : -1;
+  payload.confidence = target ? target->confidence : 0.0;
+  payload.dx_norm = target ? dx_norm : 0.0;
+  payload.dy_norm = target ? dy_norm : 0.0;
+  if (status) {
+    g_strlcpy(payload.status, status, sizeof(payload.status));
+  }
+  if (command_status) {
+    g_strlcpy(payload.command_status, command_status, sizeof(payload.command_status));
+  }
+  if (target) {
+    payload.target_id = target->track_id;
+    g_strlcpy(payload.class_name, target->label, sizeof(payload.class_name));
+  }
+
+  memcpy(region->payload, &payload, sizeof(payload));
+  region->payload_len = (guint32) sizeof(payload);
   region->frame_idx = frame_idx;
   region->ds_write_mono_ns = ds_write_mono_ns;
 
@@ -1396,6 +1482,8 @@ static void
 write_state_json(FILE *fp,
                  guint frame_idx,
                  gint64 ds_write_mono_ns,
+                 guint64 frame_pts_ns,
+                 guint64 frame_ntp_ns,
                  /* ===== LATENCY STAGE 2/3 ADDED START ===== */
                  gint64 c_probe_start_mono_ns,
                  gint64 c_control_done_mono_ns,
@@ -1429,6 +1517,8 @@ write_state_json(FILE *fp,
                                      sizeof(line_buf) - 1,
                                      frame_idx,
                                      ds_write_mono_ns,
+                                     frame_pts_ns,
+                                     frame_ntp_ns,
                                      c_probe_start_mono_ns,
                                      c_control_done_mono_ns,
                                      mux_src_mono_ns,
@@ -1513,6 +1603,9 @@ tracker_src_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_d
     FrameTargetSnapshot snapshot;
     gchar target_id_buf[32];
     const guint current_frame_idx = frame_meta ? (guint) frame_meta->frame_num : state->frame_number;
+    const guint64 frame_pts_ns =
+        (frame_meta && frame_meta->buf_pts != GST_CLOCK_TIME_NONE) ? frame_meta->buf_pts : 0U;
+    const guint64 frame_ntp_ns = frame_meta ? frame_meta->ntp_timestamp : 0U;
     guint visible_tracks = extract_candidates(frame_meta, &state->cfg, candidates, MAX_CANDIDATES);
     const gchar *status = "tracked";
     const gchar *command_status = "no_target";
@@ -1605,6 +1698,8 @@ tracker_src_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_d
         state,
         current_frame_idx,
         ds_write_mono_ns,
+        frame_pts_ns,
+        frame_ntp_ns,
         c_probe_start_mono_ns,
         c_control_done_mono_ns,
         mux_src_mono_ns,
@@ -1635,6 +1730,8 @@ tracker_src_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_d
           state->state_fp,
           current_frame_idx,
           ds_write_mono_ns,
+          frame_pts_ns,
+          frame_ntp_ns,
           /* ===== LATENCY STAGE 2/3 ADDED START ===== */
           c_probe_start_mono_ns,
           c_control_done_mono_ns,
@@ -1741,6 +1838,7 @@ main(int argc, char *argv[])
   GstPad *display_queue_pad = NULL;
   GstPad *rtsp_queue_pad = NULL;
   guint bus_watch_id = 0;
+  guint streammux_timeout_us = 33000;
 
   memset(&state, 0, sizeof(state));
   g_mutex_init(&state.latency_stage3_branch_lock);
@@ -1845,11 +1943,17 @@ main(int argc, char *argv[])
                "max-size-bytes", 0,
                "max-size-time", 0,
                NULL);
+  if (state.cfg.fps_n > 0 && state.cfg.fps_d > 0) {
+    streammux_timeout_us = (guint) ((1000000LL * state.cfg.fps_d) / state.cfg.fps_n);
+    if (streammux_timeout_us == 0) {
+      streammux_timeout_us = 1;
+    }
+  }
   g_object_set(G_OBJECT(streammux),
                "width", state.cfg.width,
                "height", state.cfg.height,
                "batch-size", 1,
-               "batched-push-timeout", 33000,
+               "batched-push-timeout", streammux_timeout_us,
                "live-source", TRUE,
                NULL);
   g_object_set(G_OBJECT(pgie), "config-file-path", state.cfg.infer_config, NULL);
@@ -1929,6 +2033,7 @@ main(int argc, char *argv[])
                  NULL);
     g_object_set(G_OBJECT(raw_record_sink),
                  "location", state.cfg.raw_record_file,
+                 "async", FALSE,
                  "sync", FALSE,
                  NULL);
   }

@@ -45,12 +45,19 @@ export MAV_TARGET_SYSTEM="${MAV_TARGET_SYSTEM:-1}"
 export MAV_TARGET_COMPONENT="${MAV_TARGET_COMPONENT:-154}"
 export GIMBAL_DEVICE_ID="${GIMBAL_DEVICE_ID:-154}"
 export METADATA_STATE_FILE="${METADATA_STATE_FILE:-}"
-export BRIDGE_STATE_FILE="${BRIDGE_STATE_FILE:-/tmp/profile640fp16_archery_target_mk15_live_bridge.jsonl}"
+export RUN_ARTIFACTS_ENABLE="${RUN_ARTIFACTS_ENABLE:-1}"
+if [[ -z "${BRIDGE_STATE_FILE:-}" && "${RUN_ARTIFACTS_ENABLE}" != "1" ]]; then
+  export BRIDGE_STATE_FILE="/tmp/profile640fp16_archery_target_mk15_live_bridge.jsonl"
+else
+  export BRIDGE_STATE_FILE="${BRIDGE_STATE_FILE:-}"
+fi
 export MAX_FRAMES="${MAX_FRAMES:-0}"
 export RAW_RECORD_ENABLE="${RAW_RECORD_ENABLE:-0}"
 if [[ "${RAW_RECORD_ENABLE}" == "1" ]] && [[ -z "${RAW_RECORD_FILE:-}" ]]; then
-  mkdir -p "${RECORDINGS_DIR}"
-  export RAW_RECORD_FILE="${RECORDINGS_DIR}/archery_target_clean_$(date +%Y%m%d-%H%M%S).mkv"
+  if [[ "${RUN_ARTIFACTS_ENABLE}" != "1" ]]; then
+    mkdir -p "${RECORDINGS_DIR}"
+    export RAW_RECORD_FILE="${RECORDINGS_DIR}/archery_target_clean_$(date +%Y%m%d-%H%M%S).mkv"
+  fi
 fi
 export RAW_RECORD_BITRATE="${RAW_RECORD_BITRATE:-40000000}"
 export RAW_RECORD_QUEUE_BUFFERS="${RAW_RECORD_QUEUE_BUFFERS:-8}"

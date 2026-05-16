@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+PROFILE_DIR = Path(__file__).resolve().parent.parent
+
 
 @dataclass
 class Segment:
@@ -22,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bridge-log",
         default="",
-        help="Bridge JSONL log path; if omitted, the script checks the common archery-target log paths",
+        help="Bridge JSONL log path; if omitted, runs/latest/detection_log.jsonl is preferred, then legacy /tmp logs",
     )
     parser.add_argument(
         "--session-index",
@@ -82,6 +84,7 @@ def resolve_bridge_log(path_arg: str) -> Path:
         return path
 
     candidates = [
+        PROFILE_DIR / "runs/latest/detection_log.jsonl",
         Path("/tmp/profile640fp16_archery_target_mk15_live_bridge.jsonl"),
         Path("/tmp/profile640fp16_archery_target_live_bridge.jsonl"),
         Path("/tmp/profile640fp16_archery_target_bridge_dryrun.jsonl"),

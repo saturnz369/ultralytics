@@ -23,9 +23,10 @@ from px4_siyi_live_bridge import PX4SiyiBridge, mavutil
 
 
 METADATA_IPC_MAGIC = 0x5056324D
-METADATA_IPC_VERSION = 1
+METADATA_IPC_VERSION = 3
 METADATA_IPC_PAYLOAD_MAX = 8192
 METADATA_IPC_HEADER = struct.Struct("<IIIIQQqII")
+METADATA_IPC_PAYLOAD = struct.Struct("<qqqqqQQIqIqIqIqII8xQiIddd64s32s32s")
 METADATA_IPC_SIZE = METADATA_IPC_HEADER.size + METADATA_IPC_PAYLOAD_MAX
 
 
@@ -56,11 +57,21 @@ class PrototypeV2BridgeState:
     timestamp: float
     # ===== LATENCY STAGE 1 ADDED START =====
     # Stage 1: DeepStream metadata output -> Python read -> MAVLink send point.
+    metadata_sequence: int
+    metadata_gap_frames: int
+    video_frame_gap: int
+    frame_pts_ns: int | None
+    frame_ntp_ns: int | None
     ds_write_mono_ns: int | None
     py_read_mono_ns: int
     mav_send_mono_ns: int
+    vision_latency_ms: float | None
+    metadata_age_ms: float | None
+    control_age_ms: float | None
+    metadata_is_fresh: bool
     ds_to_py_ms: float | None
     py_to_mav_ms: float
+    mavlink_delay_ms: float
     ds_to_mav_ms: float | None
     # ===== LATENCY STAGE 1 ADDED END =====
 
@@ -109,6 +120,7 @@ class PrototypeV2BridgeState:
     feedback_wall_time: float | None
     feedback_age_ms: float | None
     mav_send_to_feedback_ms: float | None
+    feedback_delay_ms: float | None
     manager_status_mono_ns: int | None
     device_attitude_status_mono_ns: int | None
     # ===== FEEDBACK TIMING ADDED END =====
@@ -144,6 +156,24 @@ class PrototypeV2BridgeState:
 
 
 @dataclass
+class PrototypeV2HealthState:
+    timestamp: float
+    camera_ok: bool
+    deepstream_ok: bool
+    inference_fps: float | None
+    metadata_age_ms: float | None
+    target_state: str
+    target_id: int | None
+    control_hz: float | None
+    mavlink_ok: bool
+    gimbal_feedback_ok: bool
+    jetson_temp_c: float | None
+    video_branch_ok: bool
+    recording_ok: bool
+    recording_enabled: bool
+
+
+@dataclass
 class LiveControlFilterState:
     smooth_pan_error: float = 0.0
     smooth_tilt_error: float = 0.0
@@ -172,6 +202,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-interval", type=float, default=0.005, help="Metadata polling interval in seconds")
     parser.add_argument("--camera-fps-n", type=int, default=env_int_default("CAMERA_FPS_N", 30))
     parser.add_argument("--camera-fps-d", type=int, default=env_int_default("CAMERA_FPS_D", 1))
+    parser.add_argument("--show", action="store_true", default=env_bool_default("SHOW", False))
+    parser.add_argument("--rtsp-enable", action="store_true", default=env_bool_default("RTSP_ENABLE", True))
+    parser.add_argument("--raw-record-enable", action="store_true", default=env_bool_default("RAW_RECORD_ENABLE", False))
+    parser.add_argument(
+        "--metadata-max-age-ms",
+        type=float,
+        default=env_float_default("METADATA_MAX_AGE_MS", 150.0),
+        help="Treat metadata older than this as stale and fall back to lost-target behavior",
+    )
     parser.add_argument("--pan-gain", type=float, default=env_float_default("PAN_GAIN", 0.91))
     parser.add_argument("--tilt-gain", type=float, default=env_float_default("TILT_GAIN", 0.83))
     parser.add_argument("--deadzone", type=float, default=env_float_default("DEADZONE", 0.048))
@@ -264,6 +303,28 @@ def parse_args() -> argparse.Namespace:
         default="attitude",
         choices=("attitude", "manual", "pitchyaw", "command", "message"),
         help="Gimbal control API used by the bridge",
+    )
+    parser.add_argument(
+        "--print-health",
+        action="store_true",
+        default=env_bool_default("PRINT_HEALTH", False),
+        help="Print a low-rate field health summary derived from the latest bridge state",
+    )
+    parser.add_argument(
+        "--health-print-interval-sec",
+        type=float,
+        default=env_float_default("HEALTH_PRINT_INTERVAL_SEC", 1.0),
+        help="Minimum seconds between printed health summaries",
+    )
+    parser.add_argument(
+        "--health-state-file",
+        default=os.environ.get("HEALTH_STATE_FILE", ""),
+        help="Optional JSONL file for low-rate system health summaries",
+    )
+    parser.add_argument(
+        "--health-temp-zone",
+        default=os.environ.get("HEALTH_TEMP_ZONE", "tj-thermal"),
+        help="Preferred Linux thermal zone name for Jetson temperature reporting",
     )
     return parser.parse_args()
 
@@ -460,6 +521,15 @@ def _delta_ms(newer_ns: int | None, older_ns: int | None) -> float | None:
     if newer_ns is None or older_ns is None:
         return None
     return (newer_ns - older_ns) / 1e6
+
+
+def _metadata_is_fresh(metadata_age_ms: float | None, max_age_ms: float) -> bool:
+    """Return True when the latest-only snapshot is recent enough for control."""
+    if metadata_age_ms is None:
+        return True
+    if max_age_ms <= 0.0:
+        return True
+    return metadata_age_ms <= max_age_ms
 # ===== LATENCY STAGE 1/2/3/4 ADDED END =====
 
 
@@ -481,6 +551,85 @@ def wait_for_metadata_ipc_file(metadata_ipc_file: Path, proc: subprocess.Popen, 
     raise RuntimeError(f"Timed out waiting for metadata IPC file: {metadata_ipc_file}")
 
 
+def _decode_c_string(raw: bytes) -> str:
+    """Decode a null-terminated C string from a fixed-size binary field."""
+    return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+
+def _decode_metadata_payload(
+    frame_idx: int,
+    ds_write_mono_ns: int,
+    payload_bytes: bytes,
+) -> dict:
+    (
+        c_probe_start_mono_ns,
+        c_control_done_mono_ns,
+        mux_src_mono_ns,
+        pgie_src_mono_ns,
+        tracker_src_mono_ns,
+        frame_pts_ns,
+        frame_ntp_ns,
+        video_queue_frame_idx,
+        video_queue_src_mono_ns,
+        nvosd_frame_idx,
+        nvosd_src_mono_ns,
+        display_queue_frame_idx,
+        display_queue_src_mono_ns,
+        rtsp_queue_frame_idx,
+        rtsp_queue_src_mono_ns,
+        visible_tracks,
+        lost_frames,
+        has_target,
+        target_id,
+        class_id,
+        confidence,
+        dx_norm,
+        dy_norm,
+        class_name_raw,
+        status_raw,
+        command_status_raw,
+    ) = METADATA_IPC_PAYLOAD.unpack(payload_bytes)
+
+    has_target = bool(has_target)
+    class_name = _decode_c_string(class_name_raw)
+    status = _decode_c_string(status_raw) or "searching"
+    command_status = _decode_c_string(command_status_raw) or status
+
+    return {
+        "frame_idx": frame_idx,
+        "ds_write_mono_ns": ds_write_mono_ns,
+        "c_probe_start_mono_ns": c_probe_start_mono_ns,
+        "c_control_done_mono_ns": c_control_done_mono_ns,
+        "mux_src_mono_ns": mux_src_mono_ns,
+        "pgie_src_mono_ns": pgie_src_mono_ns,
+        "tracker_src_mono_ns": tracker_src_mono_ns,
+        "frame_pts_ns": frame_pts_ns or None,
+        "frame_ntp_ns": frame_ntp_ns or None,
+        "video_queue_frame_idx": video_queue_frame_idx,
+        "video_queue_src_mono_ns": video_queue_src_mono_ns,
+        "nvosd_frame_idx": nvosd_frame_idx,
+        "nvosd_src_mono_ns": nvosd_src_mono_ns,
+        "display_queue_frame_idx": display_queue_frame_idx,
+        "display_queue_src_mono_ns": display_queue_src_mono_ns,
+        "rtsp_queue_frame_idx": rtsp_queue_frame_idx,
+        "rtsp_queue_src_mono_ns": rtsp_queue_src_mono_ns,
+        "status": status,
+        "command_status": command_status,
+        "visible_tracks": visible_tracks,
+        "lost_frames": lost_frames,
+        "target_id": target_id if has_target else None,
+        "class_id": class_id if has_target else None,
+        "class_name": class_name if has_target and class_name else None,
+        "confidence": confidence if has_target else None,
+        "dx_norm": dx_norm if has_target else None,
+        "dy_norm": dy_norm if has_target else None,
+        "smooth_dx_norm": None,
+        "smooth_dy_norm": None,
+        "pan_cmd": None,
+        "tilt_cmd": None,
+    }
+
+
 def read_latest_metadata_record(
     metadata_mm: mmap.mmap,
     proc: subprocess.Popen,
@@ -497,8 +646,8 @@ def read_latest_metadata_record(
             payload_capacity,
             _reserved0,
             sequence1,
-            _frame_idx,
-            _ds_write_mono_ns,
+            frame_idx,
+            ds_write_mono_ns,
             payload_len,
             _reserved1,
         ) = METADATA_IPC_HEADER.unpack(header1)
@@ -515,6 +664,10 @@ def read_latest_metadata_record(
                 return None
             time.sleep(poll_interval)
             continue
+        if payload_len != METADATA_IPC_PAYLOAD.size:
+            raise RuntimeError(
+                f"Unexpected metadata IPC payload size: got {payload_len}, expected {METADATA_IPC_PAYLOAD.size}."
+            )
 
         payload_bytes = metadata_mm[payload_offset : payload_offset + payload_len]
         header2 = metadata_mm[: METADATA_IPC_HEADER.size]
@@ -523,11 +676,7 @@ def read_latest_metadata_record(
             time.sleep(poll_interval)
             continue
 
-        try:
-            record = json.loads(payload_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            time.sleep(poll_interval)
-            continue
+        record = _decode_metadata_payload(frame_idx, ds_write_mono_ns, payload_bytes)
         return sequence2, record
 
 
@@ -564,6 +713,123 @@ def emit_state(state: PrototypeV2BridgeState, print_state: bool, state_handle) -
     if state_handle is not None:
         state_handle.write(payload + "\n")
         state_handle.flush()
+
+
+def resolve_temp_sensor_path(preferred_zone: str) -> Path | None:
+    thermal_root = Path("/sys/devices/virtual/thermal")
+    preferred = (preferred_zone or "").strip()
+    fallback_names = [preferred, "tj-thermal", "cpu-thermal", "gpu-thermal"]
+    seen: set[str] = set()
+
+    for zone_name in fallback_names:
+        if not zone_name or zone_name in seen:
+            continue
+        seen.add(zone_name)
+        for zone_path in thermal_root.glob("thermal_zone*"):
+            try:
+                if zone_path.joinpath("type").read_text(encoding="utf-8").strip() == zone_name:
+                    temp_path = zone_path / "temp"
+                    if temp_path.exists():
+                        return temp_path
+            except OSError:
+                continue
+    return None
+
+
+def read_jetson_temp_c(temp_sensor_path: Path | None) -> float | None:
+    if temp_sensor_path is None:
+        return None
+    try:
+        raw = temp_sensor_path.read_text(encoding="utf-8").strip()
+        value = float(raw)
+    except (OSError, ValueError):
+        return None
+    if value > 1000.0:
+        value /= 1000.0
+    return value
+
+
+def build_health_state(
+    *,
+    state: PrototypeV2BridgeState,
+    args: argparse.Namespace,
+    deepstream_ok: bool,
+    elapsed_s: float,
+    processed_rows: int,
+    first_frame_idx: int | None,
+    temp_sensor_path: Path | None,
+) -> PrototypeV2HealthState:
+    inference_fps = None
+    if elapsed_s > 0.0 and first_frame_idx is not None and state.frame_idx >= first_frame_idx:
+        inference_fps = ((state.frame_idx - first_frame_idx) + 1) / elapsed_s
+
+    control_hz = (processed_rows / elapsed_s) if elapsed_s > 0.0 else None
+
+    feedback_ok = False
+    if state.feedback_age_ms is not None:
+        feedback_ok = state.feedback_age_ms <= 2000.0
+
+    display_ok = (not args.show) or state.display_frame_lag is None or state.display_frame_lag <= 4
+    rtsp_ok = (not args.rtsp_enable) or state.rtsp_frame_lag is None or state.rtsp_frame_lag <= 4
+    video_branch_ok = display_ok and rtsp_ok
+
+    recording_ok = (not args.raw_record_enable) or deepstream_ok
+
+    camera_ok = deepstream_ok and state.frame_idx >= 0 and state.metadata_is_fresh
+
+    return PrototypeV2HealthState(
+        timestamp=state.timestamp,
+        camera_ok=camera_ok,
+        deepstream_ok=deepstream_ok,
+        inference_fps=inference_fps,
+        metadata_age_ms=state.metadata_age_ms,
+        target_state=state.status,
+        target_id=state.target_id,
+        control_hz=control_hz,
+        mavlink_ok=state.mavlink_connected,
+        gimbal_feedback_ok=feedback_ok,
+        jetson_temp_c=read_jetson_temp_c(temp_sensor_path),
+        video_branch_ok=video_branch_ok,
+        recording_ok=recording_ok,
+        recording_enabled=args.raw_record_enable,
+    )
+
+
+def format_health_summary(health: PrototypeV2HealthState) -> str:
+    target_label = health.target_state.upper()
+    if health.target_id is not None:
+        target_label = f"{target_label}, ID={health.target_id}"
+
+    yolo_text = "n/a" if health.inference_fps is None else f"{health.inference_fps:.1f} FPS"
+    age_text = "n/a" if health.metadata_age_ms is None else f"{health.metadata_age_ms:.1f} ms"
+    control_text = "n/a" if health.control_hz is None else f"{health.control_hz:.1f} Hz"
+    temp_text = "n/a" if health.jetson_temp_c is None else f"{health.jetson_temp_c:.1f} C"
+    recording_text = "OFF"
+    if health.recording_enabled:
+        recording_text = "OK" if health.recording_ok else "BAD"
+
+    return (
+        f"CAMERA: {'OK' if health.camera_ok else 'BAD'} | "
+        f"DEEPSTREAM: {'OK' if health.deepstream_ok else 'BAD'} | "
+        f"YOLO: {yolo_text} | "
+        f"TARGET: {target_label} | "
+        f"METADATA AGE: {age_text} | "
+        f"CONTROL: {control_text} | "
+        f"MAVLINK: {'OK' if health.mavlink_ok else 'BAD'} | "
+        f"GIMBAL: {'OK' if health.gimbal_feedback_ok else 'BAD'} | "
+        f"TEMP: {temp_text} | "
+        f"VIDEO: {'OK' if health.video_branch_ok else 'BAD'} | "
+        f"RECORDING: {recording_text}"
+    )
+
+
+def emit_health_state(health: PrototypeV2HealthState, print_health: bool, health_handle) -> None:
+    if print_health:
+        print(format_health_summary(health), flush=True)
+    if health_handle is not None:
+        payload = json.dumps(asdict(health), separators=(",", ":"))
+        health_handle.write(payload + "\n")
+        health_handle.flush()
 
 
 def prime_live_control(bridge: PX4SiyiBridge, args: argparse.Namespace) -> None:
@@ -654,6 +920,12 @@ def main() -> int:
         bridge_state_path.parent.mkdir(parents=True, exist_ok=True)
         bridge_state_handle = bridge_state_path.open("w", encoding="utf-8")
 
+    health_state_handle = None
+    if args.health_state_file:
+        health_state_path = Path(args.health_state_file)
+        health_state_path.parent.mkdir(parents=True, exist_ok=True)
+        health_state_handle = health_state_path.open("w", encoding="utf-8")
+
     proc, log_handle = start_combined_app(args, metadata_ipc_file, metadata_state_file)
     bridge = PX4SiyiBridge(args)
     target_pitch_deg = 0.0
@@ -663,6 +935,12 @@ def main() -> int:
     metadata_fd: int | None = None
     metadata_mm: mmap.mmap | None = None
     metadata_sequence = 0
+    previous_frame_idx: int | None = None
+    first_frame_idx: int | None = None
+    processed_rows = 0
+    active_start_time: float | None = None
+    last_health_emit_time = 0.0
+    temp_sensor_path = resolve_temp_sensor_path(args.health_temp_zone)
 
     try:
         wait_for_metadata_ipc_file(metadata_ipc_file, proc, args.startup_timeout)
@@ -680,13 +958,19 @@ def main() -> int:
             )
             if latest_record is None:
                 break
+            previous_metadata_sequence = metadata_sequence
             metadata_sequence, record = latest_record
+            metadata_gap_frames = 0
+            if previous_metadata_sequence > 0 and metadata_sequence > previous_metadata_sequence:
+                metadata_gap_frames = max(0, ((metadata_sequence - previous_metadata_sequence) // 2) - 1)
 
             # ===== LATENCY STAGE 1/2/3 ADDED START =====
             # Stage 1 T2: Python has received/read one metadata snapshot.
             py_read_mono_ns = time.monotonic_ns()
 
             # Stage 1 T1 from C metadata snapshot.
+            frame_pts_ns = _safe_int_or_none(record.get("frame_pts_ns"))
+            frame_ntp_ns = _safe_int_or_none(record.get("frame_ntp_ns"))
             ds_write_mono_ns = _safe_int_or_none(record.get("ds_write_mono_ns"))
 
             # Stage 2 timestamps from C tracker-probe/control timing.
@@ -708,12 +992,24 @@ def main() -> int:
             # ===== LATENCY STAGE 1/2/3 ADDED END =====
 
             current_frame_idx = int(record.get("frame_idx", -1))
+            if first_frame_idx is None and current_frame_idx >= 0:
+                first_frame_idx = current_frame_idx
+                active_start_time = py_read_mono_ns / 1e9
+            raw_frame_gap = (
+                max(0, current_frame_idx - previous_frame_idx - 1)
+                if previous_frame_idx is not None and previous_frame_idx >= 0 and current_frame_idx >= 0
+                else 0
+            )
+            video_frame_gap = max(0, raw_frame_gap - metadata_gap_frames)
+            previous_frame_idx = current_frame_idx
 
             status = str(record.get("status", "searching"))
             visible_tracks = int(record.get("visible_tracks", 0) or 0)
             lost_frames = int(record.get("lost_frames", 0) or 0)
             target_id = record.get("target_id")
-            has_target = target_id is not None and status not in {"searching", "lost"}
+            metadata_age_ms = _delta_ms(py_read_mono_ns, ds_write_mono_ns)
+            metadata_is_fresh = _metadata_is_fresh(metadata_age_ms, args.metadata_max_age_ms)
+            has_target = metadata_is_fresh and target_id is not None and status not in {"searching", "lost"}
             raw_dx_norm = float(record.get("dx_norm", 0.0) or 0.0) if has_target else 0.0
             raw_dy_norm = float(record.get("dy_norm", 0.0) or 0.0) if has_target else 0.0
 
@@ -729,6 +1025,8 @@ def main() -> int:
                 args=args,
                 filter_state=filter_state,
             )
+            if not metadata_is_fresh:
+                command_status = "stale"
             if not has_target and status in {"searching", "lost"}:
                 command_status = status
 
@@ -747,8 +1045,11 @@ def main() -> int:
             mav_send_mono_ns = time.monotonic_ns()
 
             # Stage 1 latency numbers.
-            ds_to_py_ms = _delta_ms(py_read_mono_ns, ds_write_mono_ns)
+            vision_latency_ms = _delta_ms(ds_write_mono_ns, mux_src_mono_ns)
+            ds_to_py_ms = metadata_age_ms
+            control_age_ms = metadata_age_ms
             py_to_mav_ms = _delta_ms(mav_send_mono_ns, py_read_mono_ns) or 0.0
+            mavlink_delay_ms = py_to_mav_ms
             ds_to_mav_ms = _delta_ms(mav_send_mono_ns, ds_write_mono_ns)
 
             # Stage 2 latency numbers.
@@ -799,16 +1100,27 @@ def main() -> int:
                 if feedback_mono_ns is not None and feedback_mono_ns >= mav_send_mono_ns
                 else None
             )
+            feedback_delay_ms = mav_send_to_feedback_ms
 
             state = PrototypeV2BridgeState(
                 frame_idx=current_frame_idx,
                 timestamp=time.time(),
                 # ===== LATENCY STAGE 1 ADDED START =====
+                metadata_sequence=metadata_sequence,
+                metadata_gap_frames=metadata_gap_frames,
+                video_frame_gap=video_frame_gap,
+                frame_pts_ns=frame_pts_ns,
+                frame_ntp_ns=frame_ntp_ns,
                 ds_write_mono_ns=ds_write_mono_ns,
                 py_read_mono_ns=py_read_mono_ns,
                 mav_send_mono_ns=mav_send_mono_ns,
+                vision_latency_ms=vision_latency_ms,
+                metadata_age_ms=metadata_age_ms,
+                control_age_ms=control_age_ms,
+                metadata_is_fresh=metadata_is_fresh,
                 ds_to_py_ms=ds_to_py_ms,
                 py_to_mav_ms=py_to_mav_ms,
+                mavlink_delay_ms=mavlink_delay_ms,
                 ds_to_mav_ms=ds_to_mav_ms,
                 # ===== LATENCY STAGE 1 ADDED END =====
 
@@ -854,6 +1166,7 @@ def main() -> int:
                 feedback_wall_time=feedback_wall_time,
                 feedback_age_ms=feedback_age_ms,
                 mav_send_to_feedback_ms=mav_send_to_feedback_ms,
+                feedback_delay_ms=feedback_delay_ms,
                 manager_status_mono_ns=bridge.last_manager_status_mono_ns,
                 device_attitude_status_mono_ns=bridge.last_device_attitude_status_mono_ns,
                 # ===== FEEDBACK TIMING ADDED END =====
@@ -888,6 +1201,26 @@ def main() -> int:
                 metadata_ipc_file=str(metadata_ipc_file),
             )
             emit_state(state, args.print_state, bridge_state_handle)
+            processed_rows += 1
+
+            now_wall = state.timestamp
+            interval = max(0.1, args.health_print_interval_sec)
+            if args.print_health or health_state_handle is not None:
+                if last_health_emit_time == 0.0 or (now_wall - last_health_emit_time) >= interval:
+                    elapsed_s = 0.0
+                    if active_start_time is not None:
+                        elapsed_s = max(0.0, (py_read_mono_ns / 1e9) - active_start_time)
+                    health = build_health_state(
+                        state=state,
+                        args=args,
+                        deepstream_ok=(proc.poll() is None),
+                        elapsed_s=elapsed_s,
+                        processed_rows=processed_rows,
+                        first_frame_idx=first_frame_idx,
+                        temp_sensor_path=temp_sensor_path,
+                    )
+                    emit_health_state(health, args.print_health, health_state_handle)
+                    last_health_emit_time = now_wall
     finally:
         try:
             bridge.close()
@@ -908,6 +1241,8 @@ def main() -> int:
             log_handle.close()
         if bridge_state_handle is not None:
             bridge_state_handle.close()
+        if health_state_handle is not None:
+            health_state_handle.close()
         try:
             if metadata_ipc_file.exists():
                 metadata_ipc_file.unlink()

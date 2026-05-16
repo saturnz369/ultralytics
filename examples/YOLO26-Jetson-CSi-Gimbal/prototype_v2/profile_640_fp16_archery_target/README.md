@@ -1,334 +1,468 @@
 # Profile 640 FP16 Archery Target
 
-This is a separate sibling profile for a custom single-class `target_face` detector:
+This is the main real `prototype_v2` profile for the custom single-class `target_face` detector:
 
 - `/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target`
 
-It is based on the current clean `profile_640_fp16` runtime, but it is wired for a custom one-class model instead of the original COCO/person model.
+This README is the source-of-truth overview for:
 
-## Current Status
+- hardware setup
+- current verified runtime state
+- model / engine workflow
+- launch modes
+- run artifacts
+- control / video architecture
+- recording and post-run analysis
 
-- The runtime architecture is copied from the clean working `profile_640_fp16` profile.
-- The control / streaming separation is preserved:
-  - latest-only shared-memory metadata handoff
-  - Python MAVLink bridge outside the DeepStream callback
-  - monitoring branch behind the video-side queue / OSD / tee path
-- The new infer config is already set to:
-  - `num-detected-classes=1`
-  - `TARGET_CLASS_ID=0`
-  - `model/labels.txt = target_face`
-- The custom model is now imported into this Jetson profile.
-- Runtime model artifacts now exist:
-  - `model/best.pt`
-  - `model/target_face_v1_native_640.onnx`
-  - `model/model_b1_gpu0_fp16.engine`
-- The serious FP16 TensorRT engine is already rebuilt and deserializes cleanly.
-- Local `target_face` detection is working on the Jetson display.
-- Real PX4 / SIYI gimbal control is working again on the old board.
-- The MK15 `/stream` RTSP path was fixed in the full gimbal+stream wrapper and now decodes cleanly again from the exact full launcher path.
-- At this point the main runtime bring-up is done. Remaining work is mostly model-quality iteration and future `v2` training improvements.
+Sub-docs still exist, but they are operator-focused extensions:
 
-Current practical meaning:
+- `streaming/README.md`
+- `recordings/README.md`
 
-- tracking-only tests do not need PX4 or the gimbal
-- bridge dry-run does not need PX4 or the gimbal
-- real bridge testing needs PX4/SIYI connected through the serial device, normally `/dev/ttyUSB0`
-- the recording workflow is the same main application launch plus `RAW_RECORD_ENABLE=1`
+If this README and the launch scripts ever disagree, trust the scripts first and then update this README immediately.
 
-## Current Hardware / Runtime
+## Purpose
+
+This profile is the custom archery-target version of the clean `prototype_v2` runtime.
+
+Compared with the base `profile_640_fp16`:
+
+- the detector is one-class `target_face`
+- the infer config is wired for `TARGET_CLASS_ID=0`
+- the runtime keeps the same split between:
+  - metadata/control branch
+  - monitoring/video branch
+
+The goal is:
+
+- use DeepStream + TensorRT for live CSI inference/tracking
+- publish only lightweight target metadata into control
+- send live MAVLink gimbal commands through PX4 to the SIYI gimbal
+- allow preview / RTSP / recording to lag or drop without dragging control with it
+
+## Current Verified State
+
+This is the current known-good state of the profile:
+
+- main deployment camera is the e-con IMX412 setup
+- current working camera path is `CAM1`
+- current application default is `2028x1112 @ 60`
+- YOLO inference stays `640x640`
+- current full MK15 URL is:
+  - `rtsp://192.168.144.100:8554/stream`
+- current full-control launcher works again with:
+  - IMX412
+  - PX4
+  - SIYI
+  - MK15 RTSP
+- the control path is latest-only and binary shared-memory based
+- stale metadata is age-gated in the Python bridge
+- monitoring branch errors are disposable by default
+- run artifacts are bundled automatically under `runs/<tag>/`
+- health printing / health log / latency summary are integrated
+
+Current active runtime files:
+
+- `model/best.pt`
+- `model/target_face_v1_native_640.onnx`
+- `model/model_b1_gpu0_fp16.engine`
+- `model/labels.txt`
+
+Important note:
+
+- the current accepted weight in `model/best.pt` is the active runtime model
+- `target_face_v1_native_640.onnx` is still the current ONNX filename for compatibility
+- do not assume the `v1` string in that ONNX filename means the active model is still training `v1`
+
+Training archives are preserved separately:
+
+- `training_weight/v1/`
+- `training_weight/v2/`
+
+## Hardware And Runtime Stack
+
+Current main stack:
 
 - Jetson: Orin NX
-- JetPack/L4T used for the camera driver work: JetPack 6.2.1 / L4T 36.4.4
+- JetPack / L4T: JetPack `6.2.1`, L4T `36.4.4`
 - DeepStream: `/opt/nvidia/deepstream/deepstream -> deepstream-7.1`
 - CUDA: `/usr/local/cuda-12.6`
-- Camera: e-con e-CAM121_CUONX / IMX412 CSI camera
-- Camera connector used in the current working setup: CAM1
-- FFC cable requirement from the working hardware setup: 22-pin, 0.5 mm pitch, Type A
-- Main camera/application default for this profile: `2028x1112 @ 60`
+- main camera: e-con `e-CAM121_CUONX` / IMX412
+- main camera connector: `CAM1`
+- working FFC type: `22-pin`, `0.5 mm pitch`, `Type A`
 - DeepStream-Yolo parser:
   - `/home/saturnzzz/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so`
 - Python runtime for model export and bridge:
   - `/home/saturnzzz/DeepStream-Yolo/.venv-yolo26-sys/bin/python`
+- normal MAVLink serial device:
+  - `/dev/ttyUSB0`
+- normal USB-UART converter identity:
+  - CP2102 / Silicon Labs style adapter
 
-## Prototype Workflow
+Physical system around this profile:
 
-This profile is not split into separate systems. It is one runtime workflow with a few launch modes:
+- CSI camera -> Jetson
+- Jetson USB-UART -> PX4 / gimbal serial path
+- PX4 -> SIYI gimbal through MAVLink gimbal-manager path
+- Jetson Ethernet -> MK15 air unit for RTSP monitoring
+- optional Jetson local preview over HDMI / DP / desktop session
 
-- normal application launch
-  - full MK15 + gimbal + RTSP
-  - low-latency control path stays separate from the monitoring path
-- dataset launch
-  - same runtime as the normal launch
-  - adds `RAW_RECORD_ENABLE=1`
-  - records a clean pre-OSD MKV for later frame extraction
-- model iteration launch
-  - rebuild ONNX / TensorRT from `model/best.pt`
-  - keep the same runtime settings when comparing `v1` vs `v2`
+Current practical wiring detail:
 
-The latency-sensitive design is intentional:
+- IMX412 camera:
+  - physically connected to Jetson `CAM1`
+  - uses the working `22-pin`, `0.5 mm`, `Type A` FFC path above
+- MK15 air unit -> PX4 telemetry/control side:
+  - PX4 `TELEM1` is currently used by the MK15 air unit
+  - current baud is `57600 8N1`
+  - this is separate from the Jetson bridge UART
+  - in the current aircraft setup, the MK15 set is also part of the flight-control side through the MK15 air-unit wiring path
+  - practical meaning:
+    - `TELEM1` is reserved for MK15
+    - do not reuse that port for the Jetson bridge or the SIYI gimbal
+- Jetson -> PX4 control serial link:
+  - Jetson side normally appears as `/dev/ttyUSB0`
+  - current USB-UART adapter is CP2102 / Silicon Labs style
+  - current launcher default baud is `921600 8N1`
+  - current launcher identity defaults are:
+    - `MAV_SOURCE_SYSTEM=42`
+    - `MAV_SOURCE_COMPONENT=191`
+    - `MAV_TARGET_SYSTEM=1`
+    - `MAV_TARGET_COMPONENT=154`
+    - `GIMBAL_DEVICE_ID=154`
+  - current working project convention is that this Jetson serial link lands on the PX4 external MAVLink UART used for the Jetson bridge
+  - in the current field setup this is `TELEM2 / MAV_1`
+  - PX4 `TELEM2` baud must match the Jetson side:
+    - `921600 8N1`
+- PX4 -> SIYI gimbal serial link:
+  - this is a separate PX4 UART from the Jetson bridge UART
+  - in the current field setup this is `TELEM3 / MAV_2`
+  - current baud is `115200 8N1`
+  - this repo does not directly open that gimbal UART from Jetson
+  - the repo assumes PX4 already exposes the SIYI gimbal through the MAVLink gimbal-manager path
+- Jetson Ethernet -> MK15:
+  - Jetson Ethernet goes to the MK15 air unit network side
+  - current full stream URL is `rtsp://192.168.144.100:8554/stream`
+- local Jetson operator view:
+  - optional local preview comes from the display session, usually `DISPLAY=:1`
 
-- tracker metadata is published as latest-only state
-- Python control consumes only the newest metadata snapshot
-- video/display/RTSP use leaky queues so slow monitoring does not block control
-- raw recording is separate and optional, not part of the control path
+Current PX4 serial map summary:
 
-Use `2028x1112 @ 60` as the main profile default. Use `1280x720 @ 60` only if you explicitly want a lighter fallback run.
+- `TELEM1 / MK15 air unit`
+  - `57600 8N1`
+- `TELEM2 / Jetson bridge`
+  - `921600 8N1`
+- `TELEM3 / SIYI gimbal`
+  - `115200 8N1`
 
-## Expected Model Files
+If serial or USB naming changes after reconnecting hardware, check:
 
-This profile expects:
-
-- input weight:
-  - `model/best.pt`
-- generated ONNX:
-  - `model/target_face_v1_native_640.onnx`
-- generated TensorRT engine:
-  - `model/model_b1_gpu0_fp16.engine`
-- labels:
-  - `model/labels.txt`
-
-The current default label file already contains:
-
-```text
-target_face
+```bash
+ls -l /dev/ttyUSB* /dev/serial/by-id 2>/dev/null
 ```
 
-If your real class name should be different, edit [labels.txt](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/labels.txt).
+## IMX412 Driver Setup And Recovery Workflow
 
-## Import The Trained Weight
+This profile is built around the e-con `e-CAM121_CUONX` / IMX412 stack. If the IMX412 side stops working, this is the driver workflow that got it working on this Jetson.
 
-Your PC-side trained weight is:
+Vendor reference folder:
 
-```text
-/home/saturn/ultralytics/examples/custom_training/model_v1/runs/yolo26n_target_face_v1/weights/best.pt
+```bash
+/home/saturnzzz/e-CAM121_CUONX
 ```
 
-Put that file into this Jetson profile as:
+Correct vendor package for this machine:
 
-```text
-/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/best.pt
+```bash
+/home/saturnzzz/e-CAM121_CUONX/e-CAM121_CUONX_JETSON_ONX_ONANO_L4T36.4.4_07-NOV-2025_R05.tar.gz
 ```
 
-Once that file exists, this profile can generate its ONNX and rebuild the engine locally.
+Important:
 
-Original imported training artifacts are also preserved here:
+- this Jetson is on `JetPack 6.2.1 / L4T 36.4.4 / kernel 5.15.148-tegra`
+- do **not** install the old `L4T35.x` e-con package on this machine
+- the working physical connection is:
+  - camera on `CAM1`
+  - `22-pin`, `0.5 mm pitch`, `Type A` FFC
+  - correct cable orientation on both ends
 
-- [training_weight/best.pt](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/training_weight/best.pt)
-- [training_weight/best.onnx](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/training_weight/best.onnx)
+### IMX412 Fresh Install
 
-## Quick Start
+Use this when bringing up IMX412 on a clean or repaired Jetson image:
 
-Run all commands from the repo root:
+```bash
+cd /home/saturnzzz/e-CAM121_CUONX
+tar -xaf e-CAM121_CUONX_JETSON_ONX_ONANO_L4T36.4.4_07-NOV-2025_R05.tar.gz
+cd e-CAM121_CUONX_JETSON_ONX_ONANO_L4T36.4.4_07-NOV-2025_R05
+sudo chmod +x ./install_binaries.sh
+sudo -E ./install_binaries.sh
+```
+
+What that installer changes:
+
+- installs the e-con camera driver module
+- installs the matching NVIDIA camera support modules
+- installs the IMX412 device-tree overlay
+- updates `/boot/extlinux/extlinux.conf`
+- installs the e-con Argus ISP tuning file:
+  - `/var/nvidia/nvcam/settings/camera_overrides.isp`
+
+Expected boot state after install:
+
+```text
+DEFAULT JetsonIO
+MENU LABEL Custom Header Config: <CSI Jetson camera EIMX412 4lane>
+OVERLAYS /boot/tegra234-p3767-0000-p3768-0000-a0-4lane-imx412.dtbo
+```
+
+The vendor installer reboots the Jetson at the end.
+
+### IMX412 Post-Reboot Verification
+
+After reboot, verify the stack with:
+
+```bash
+grep -nE "^DEFAULT|^LABEL|MENU LABEL|OVERLAYS" /boot/extlinux/extlinux.conf
+lsmod | grep -E "e_con_cam|tegra_camera"
+ls -l /dev/video* /dev/media* /dev/v4l-subdev* 2>/dev/null
+v4l2-ctl --list-devices
+media-ctl -p -d /dev/media0
+```
+
+Expected signs of success:
+
+- `DEFAULT JetsonIO` is active
+- `/boot/tegra234-p3767-0000-p3768-0000-a0-4lane-imx412.dtbo` is the active overlay
+- `e_con_cam` is loaded
+- `/dev/video0` exists
+- `v4l2-ctl --list-devices` shows:
+  - `vi-output, e-con_cam 9-0042`
+- `media-ctl` shows:
+  - `e-con_cam 9-0042`
+
+Argus / CSI smoke test:
+
+```bash
+gst-launch-1.0 -q nvarguscamerasrc sensor-id=0 num-buffers=1 ! 'video/x-raw(memory:NVMM),width=2028,height=1112,framerate=60/1' ! fakesink
+```
+
+### IMX412 If Color Or ISP Looks Wrong
+
+The IMX412 image quality on this profile depends on the e-con ISP override being active.
+
+Working active file:
+
+```bash
+/var/nvidia/nvcam/settings/camera_overrides.isp
+```
+
+Known-good vendor source:
+
+```bash
+/home/saturnzzz/e-CAM121_CUONX/e-CAM121_CUONX_JETSON_ONX_ONANO_L4T36.4.4_07-NOV-2025_R05/misc/camera_overrides_jetson-onx.isp
+```
+
+Quick integrity check:
+
+```bash
+sha256sum /var/nvidia/nvcam/settings/camera_overrides.isp \
+  /home/saturnzzz/e-CAM121_CUONX/e-CAM121_CUONX_JETSON_ONX_ONANO_L4T36.4.4_07-NOV-2025_R05/misc/camera_overrides_jetson-onx.isp
+```
+
+Expected current good hash:
+
+```text
+0ce06fc106f550fd555a3749c9ae6de625b15ad4325a6a38e07f923de6fd8643
+```
+
+If the hashes do not match and the IMX412 image looks wrong, restore the vendor ISP file, restart Argus, and reboot if needed.
+
+## Backup Camera Workflow: ArduCam IMX477
+
+Normal deployment camera is still IMX412. The ArduCam IMX477 is the backup plan only.
+
+Use this backup path only when:
+
+- IMX412 hardware is unavailable
+- you intentionally want to test the ArduCam path
+- you accept that this is a separate camera stack from the main profile
+
+Important:
+
+- do **not** assume NVIDIA stock `imx477-A` or `imx477-C` overlays are enough here
+- on this Jetson, stock overlay probing failed with:
+  - `imx477 9-001a: i2c read probe (-121)`
+- the working path was ArduCam's own installer
+
+### ArduCam IMX477 Install Flow
+
+Power off, physically swap to the ArduCam, then run:
+
+```bash
+cd ~
+wget https://github.com/ArduCAM/MIPI_Camera/releases/download/v0.0.3/install_full.sh
+chmod +x install_full.sh
+./install_full.sh -m imx477
+sudo depmod -a
+sudo reboot
+```
+
+Practical note:
+
+- during the original install, the script printed:
+  - `mv: cannot stat '/boot/arducam/arducam_csi2.ko': No such file or directory`
+- despite that message, the IMX477 stack worked after `depmod -a` and reboot
+
+What the installer changes:
+
+- installs ArduCam camera modules
+- installs ArduCam boot image / DTB assets under `/boot/arducam`
+- updates boot to use the ArduCam camera stack
+
+### ArduCam Post-Reboot Verification
+
+After reboot, verify with:
+
+```bash
+ls -l /dev/video* /dev/media* /dev/v4l-subdev* 2>/dev/null
+v4l2-ctl --list-devices
+media-ctl -p -d /dev/media0
+journalctl -k --no-pager | grep -Ei "imx477|arducam|camera|camrtc|nvargus|csi|probe|i2c" | tail -n 120
+gst-launch-1.0 -q nvarguscamerasrc sensor-id=0 num-buffers=1 ! 'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=60/1' ! fakesink
+```
+
+Expected signs of success:
+
+- `/dev/video0` exists
+- `/dev/v4l-subdev0..2` exist
+- `media-ctl` shows:
+  - `imx477 9-001a`
+- Argus capture succeeds at:
+  - `1920x1080 @ 60`
+
+### Returning From ArduCam Back To IMX412
+
+Before using this main profile again:
+
+1. restore the IMX412 boot path:
+   - `DEFAULT JetsonIO`
+   - `OVERLAYS /boot/tegra234-p3767-0000-p3768-0000-a0-4lane-imx412.dtbo`
+2. physically swap the camera back to the e-con IMX412 on `CAM1`
+3. make sure the e-con ISP file is active again:
+   - `/var/nvidia/nvcam/settings/camera_overrides.isp`
+4. reboot and rerun the IMX412 verification steps above
+
+## Camera Modes
+
+Main profile default:
+
+- `SENSOR_ID=0`
+- `CAMERA_WIDTH=2028`
+- `CAMERA_HEIGHT=1112`
+- `CAMERA_FPS_N=60`
+- `CAMERA_FPS_D=1`
+
+Meaning:
+
+- raw CSI input is `2028x1112 @ 60`
+- YOLO inference is still `640x640`
+- RTSP / preview operate from the full pipeline capture mode, not from `640x640`
+
+Known alternate modes:
+
+- lighter fallback:
+  - `1280x720 @ 60`
+- high-speed candidate:
+  - `2028x1112 @ 240`
+
+Use `2028x1112 @ 60` as the normal source-of-truth deployment mode unless a specific test needs something else.
+
+## Operator Notes
+
+Use these rules when testing or flying:
+
+- do not confuse RTSP smoothness with control latency
+- local preview and MK15 stream can lag a little while control is still fresh
+- if you want the cleanest real control test, reduce monitoring load first
+- if you want reproducible comparisons, keep:
+  - same power mode
+  - same camera mode
+  - same model
+  - same gains
+  - same launch path
+
+Useful mental model:
+
+- camera/input quality affects detection quality
+- TensorRT / DeepStream / tracker affect metadata quality and timing
+- RTSP / display mostly affect what the operator sees
+
+## Repository Layout
+
+Main files that matter:
+
+- `deepstream_yolo26_rtsp_target_control.c`
+  - main DeepStream application
+- `deepstream_px4_siyi_bridge.py`
+  - live bridge from latest metadata to control commands
+- `px4_siyi_live_bridge.py`
+  - MAVLink backend for PX4 / SIYI control
+- `run_deepstream_yolo26_rtsp_target_control.sh`
+  - direct DeepStream app launcher
+- `run_deepstream_px4_siyi_bridge.sh`
+  - full combined live launcher
+- `streaming/run_mk15_yolo_gimbal_rtsp.sh`
+  - one-shot full MK15 + gimbal launcher
+- `prepare_prototype_v2_model.sh`
+  - ONNX preparation from `model/best.pt`
+- `config/config_infer_primary_yolo26.txt`
+  - infer config
+- `config/tracker_config.txt`
+  - tracker config
+- `tools/extract_latest_failure_frames.sh`
+  - latest run failure-frame extractor
+- `tools/bridge_latency_report.py`
+  - latency summary
+- `tools/bridge_failure_report.py`
+  - failure-window summary
+
+## Launch Matrix
+
+Run all commands from:
 
 ```bash
 cd /home/saturnzzz/ultralytics
 ```
 
-### 1. Build The App
+### 1. Rebuild The App
 
 ```bash
 make -C /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target clean all
 ```
 
-### 2. Generate The ONNX From `best.pt`
+### 2. Prepare ONNX From The Active Weight
 
-After `model/best.pt` is copied into this folder:
+Use this after replacing `model/best.pt` with a new accepted weight:
 
 ```bash
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/prepare_prototype_v2_model.sh
 ```
 
-This will:
+This refreshes:
 
-- export ONNX from `model/best.pt`
-- write `model/target_face_v1_native_640.onnx`
-- refresh `model/labels.txt`
-- delete any old engine so DeepStream rebuilds it
+- `model/target_face_v1_native_640.onnx`
+- `model/labels.txt`
 
-Current exported runtime ONNX:
+and removes any old engine so the next run rebuilds or reloads cleanly.
 
-- input: `1x3x640x640`
-- output: `1x300x6`
-- opset: `17`
+### 3. Preview Only, No PX4, No Gimbal
 
-Optional overrides:
-
-```bash
-export WEIGHTS='/some/other/path/best.pt'
-export DEFAULT_LABEL='target_face'
-export LABELS_SOURCE='/some/other/labels.txt'
-```
-
-### 3. First Detection / Preview Test
-
-This is the first test to run after the ONNX exists.
+Use this for first visual validation:
 
 ```bash
 export DISPLAY=:1
 export SHOW=1
 export RTSP_ENABLE=0
-export SENSOR_ID=0
-export CAMERA_WIDTH=2028
-export CAMERA_HEIGHT=1112
-export CAMERA_FPS_N=60
-export CAMERA_FPS_D=1
-export TARGET_CLASS_ID=0
-export SELECTION='center'
-export MAX_FRAMES=0
-bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_yolo26_rtsp_target_control.sh
-```
-
-If you want to switch this profile to the higher-speed IMX412 mode later, change only the camera block to:
-
-```bash
-export SENSOR_ID=0
-export CAMERA_WIDTH=2028
-export CAMERA_HEIGHT=1112
-export CAMERA_FPS_N=240
-export CAMERA_FPS_D=1
-```
-
-Notes:
-
-- `TARGET_CLASS_ID=0` is correct for this one-class model.
-- The first run will also build `model/model_b1_gpu0_fp16.engine`.
-
-## Engine Build Workflow
-
-Use the engine workflow below when you want to bring up a new model version cleanly.
-
-Important:
-
-- use the command as **one copy-paste command**
-- do **not** break the ONNX or engine path across lines in the middle of the path
-- terminal visual wrapping is okay, but do not insert a real newline inside the path
-
-### Stage 1: Fast First-Pass Build
-
-Use this first when you want a quick runtime-valid engine for inspection and testing:
-
-```bash
-/usr/src/tensorrt/bin/trtexec --onnx=/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/target_face_v1_native_640.onnx --saveEngine=/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine --fp16 --memPoolSize=workspace:256 --avgTiming=1 --builderOptimizationLevel=0 --skipInference
-```
-
-What this does:
-
-- rebuilds the engine from the exported `640x640` ONNX
-- keeps the engine in `FP16`
-- reduces TensorRT tactic search effort so engine creation finishes sooner
-
-Optional backup if you want to preserve that quick engine before rebuilding seriously later:
-
-```bash
-cp /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.fastpass.engine
-```
-
-Current fast first-pass backup path:
-
-- [model_b1_gpu0_fp16.fastpass.engine](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.fastpass.engine)
-
-### Stage 1 Check
-
-1. `trtexec` returns to the shell without a failure message.
-2. The engine file timestamp changes:
-
-```bash
-stat /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine
-```
-
-3. Run a short DeepStream sanity test:
-
-```bash
-cd /home/saturnzzz/ultralytics
-SHOW=0 RTSP_ENABLE=0 MAX_FRAMES=60 TARGET_CLASS_ID=0 SELECTION=center bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_yolo26_rtsp_target_control.sh
-```
-
-4. In that DeepStream output, you want to see:
-
-- `deserialized trt engine from`
-- `Use deserialized engine model`
-
-### Stage 1 Real Test
-
-After the sanity run passes, do your real local preview or MK15 test with this first-pass engine.
-
-Local preview:
-
-```bash
-cd /home/saturnzzz/ultralytics
-export DISPLAY=:1
-export SHOW=1
-export RTSP_ENABLE=0
-export TARGET_CLASS_ID=0
-export SELECTION='center'
-bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_yolo26_rtsp_target_control.sh
-```
-
-MK15 YOLO stream:
-
-```bash
-cd /home/saturnzzz/ultralytics
-bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/streaming/run_mk15_yolo_rtsp.sh
-```
-
-### Stage 2: Serious Final Rebuild
-
-After the first-pass engine is validated, rebuild the stronger final-style engine:
-
-```bash
-/usr/src/tensorrt/bin/trtexec --onnx=/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/target_face_v1_native_640.onnx --saveEngine=/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine --fp16 --memPoolSize=workspace:1024 --builderOptimizationLevel=5 --skipInference
-```
-
-What this does:
-
-- rebuilds the same `640x640` model into a stronger final-style engine
-- keeps the engine in `FP16`
-- uses a larger workspace than the fast first-pass build
-- uses a higher TensorRT optimization effort than the fast first-pass build
-
-### Stage 2 Check
-
-1. `trtexec` returns to the shell without a failure message.
-2. The engine file timestamp changes:
-
-```bash
-stat /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine
-```
-
-3. Run a short DeepStream sanity test:
-
-```bash
-cd /home/saturnzzz/ultralytics
-SHOW=0 RTSP_ENABLE=0 MAX_FRAMES=60 TARGET_CLASS_ID=0 SELECTION=center bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_yolo26_rtsp_target_control.sh
-```
-
-4. In that DeepStream output, you want to see:
-
-- `deserialized trt engine from`
-- `Use deserialized engine model`
-
-You do **not** want to see it trying to rebuild the engine again.
-
-### Stage 2 Real Test
-
-After the serious engine passes the sanity test, repeat the same real preview or MK15 test again. That is the runtime baseline you should use when deciding what `v2` needs to improve.
-
-### If You Want To Force A Fresh Rebuild
-
-Delete the current engine first:
-
-```bash
-rm -f /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine
-```
-
-Then rerun:
-
-```bash
-cd /home/saturnzzz/ultralytics
-export DISPLAY=:1
-export SHOW=1
-export RTSP_ENABLE=1
-export RTSP_PORT=8554
 export SENSOR_ID=0
 export CAMERA_WIDTH=2028
 export CAMERA_HEIGHT=1112
@@ -342,12 +476,13 @@ bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/
 
 ### 4. Bridge Dry-Run
 
-Use this before PX4/SIYI hardware is involved.
+Use this before PX4/SIYI is involved:
 
 ```bash
-cd /home/saturnzzz/ultralytics
 export DRY_RUN_MAVLINK=1
 export PRINT_STATE=1
+export PRINT_HEALTH=1
+export HEALTH_PRINT_INTERVAL_SEC=1.0
 export SHOW=0
 export RTSP_ENABLE=0
 export MAX_FRAMES=90
@@ -357,16 +492,14 @@ export CONTROL_API=command
 export LIVE_CONTROL_MODE=angle-target
 export MAV_INVERT_PAN=0
 export MAV_INVERT_TILT=0
-export BRIDGE_STATE_FILE='/tmp/profile640fp16_archery_target_bridge_dryrun.jsonl'
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_px4_siyi_bridge.sh
 ```
 
-### 5. Real PX4 / SIYI Run
+### 5. Real Full Control, Local Only
 
-Use this only after the `target_face` detector is already working locally.
+Use this when PX4/SIYI is connected and you want local preview but not MK15 RTSP:
 
 ```bash
-cd /home/saturnzzz/ultralytics
 export DISPLAY=:1
 export SHOW=1
 export RTSP_ENABLE=0
@@ -404,65 +537,174 @@ export MAV_SOURCE_COMPONENT=191
 export MAV_TARGET_SYSTEM=1
 export MAV_TARGET_COMPONENT=154
 export GIMBAL_DEVICE_ID=154
-export BRIDGE_STATE_FILE='/tmp/profile640fp16_archery_target_live_bridge.jsonl'
+export PRINT_HEALTH=1
+export HEALTH_PRINT_INTERVAL_SEC=1.0
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_px4_siyi_bridge.sh
 ```
 
-To switch this full-control block to the higher-speed camera mode later, change only:
+### 6. Real Full Control With MK15
+
+This is the normal one-shot flight/test launcher:
 
 ```bash
-export SENSOR_ID=0
-export CAMERA_WIDTH=2028
-export CAMERA_HEIGHT=1112
-export CAMERA_FPS_N=240
-export CAMERA_FPS_D=1
+bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/streaming/run_mk15_yolo_gimbal_rtsp.sh
 ```
 
-## Streaming / MK15
+Normal meaning:
 
-This profile also has the same MK15 streaming layer as the main profile:
+- this does **not** record by default
+- current default is `RAW_RECORD_ENABLE=0`
+- use [recordings/README.md](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/recordings/README.md) when you intentionally want the same application launch with clean recording enabled
 
-- [streaming/README.md](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/streaming/README.md)
+MK15 URL:
 
-That means you can later run:
+```text
+rtsp://192.168.144.100:8554/stream
+```
 
-- camera-only RTSP
-- YOLO overlay RTSP
-- YOLO + gimbal + RTSP
-- YOLO + gimbal + RTSP + clean pre-OSD recording for dataset extraction
+### 7. Real Full Control With Clean Dataset Recording
 
-For flight/test dataset collection, use the full MK15 launcher with clean raw recording enabled:
+Use the dedicated recording operator note instead of duplicating the record-enabled launch here:
+
+- [recordings/README.md](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/recordings/README.md)
+
+### 8. Extract Failure Frames After The Run
+
+Use the recording README for the post-run recording and extraction flow:
+
+- [recordings/README.md](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/recordings/README.md)
+
+## Model And Engine Workflow
+
+Active runtime model files:
+
+- `model/best.pt`
+- `model/target_face_v1_native_640.onnx`
+- `model/model_b1_gpu0_fp16.engine`
+- `model/labels.txt`
+
+Training archives:
+
+- `training_weight/v1/best.pt`
+- `training_weight/v1/best.onnx`
+- `training_weight/v2/best.pt`
+- `training_weight/v2/best.onnx`
+
+Normal rule:
+
+- copy the accepted weight into `model/best.pt`
+- run `prepare_prototype_v2_model.sh`
+- rebuild or reload the engine
+- test under the same runtime settings as the previous model
+
+### Fast First-Pass Engine Build
 
 ```bash
-cd /home/saturnzzz/ultralytics
-RAW_RECORD_ENABLE=1 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/streaming/run_mk15_yolo_gimbal_rtsp.sh
+/usr/src/tensorrt/bin/trtexec --onnx=/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/target_face_v1_native_640.onnx --saveEngine=/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine --fp16 --memPoolSize=workspace:256 --avgTiming=1 --builderOptimizationLevel=0 --skipInference
 ```
 
-After stopping the run, extract the missed-detection frames from the newest clean recording:
+### Serious Final Engine Build
 
 ```bash
-bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/tools/extract_latest_failure_frames.sh
+/usr/src/tensorrt/bin/trtexec --onnx=/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/target_face_v1_native_640.onnx --saveEngine=/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine --fp16 --memPoolSize=workspace:1024 --builderOptimizationLevel=5 --skipInference
 ```
 
-The output zip under `recordings/` is the one to move to the PC and label. The clean recording is taken from the camera-side branch before inference, tracker, OSD, RTSP, and debug drawing.
+If you want to force a clean rebuild:
 
-## Current Clean Runtime Architecture
+```bash
+rm -f /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/model_b1_gpu0_fp16.engine
+```
 
-The current runtime is now much closer to the intended `prototype_v2` design.
+## Run Artifacts
 
-Actual live flow:
+By default:
+
+- `RUN_ARTIFACTS_ENABLE=1`
+
+Each launcher creates:
+
+```text
+runs/<tag>/
+```
+
+and refreshes:
+
+```text
+runs/latest/
+```
+
+Typical files inside one run:
+
+- `config_used.yaml`
+- `detection_log.jsonl`
+- `health_log.jsonl`
+- `deepstream.log`
+- `performance_summary.txt`
+- `recording_clean.mkv` when `RAW_RECORD_ENABLE=1`
+
+Current helper tools prefer `runs/latest/` automatically:
+
+- `tools/extract_latest_failure_frames.sh`
+- `tools/bridge_latency_report.py`
+- `tools/bridge_failure_report.py`
+
+If you intentionally want the old loose-file behavior:
+
+```bash
+export RUN_ARTIFACTS_ENABLE=0
+```
+
+## Recording And Post-Run Analysis
+
+The clean recording path is intentionally separate from overlays and RTSP:
+
+```text
+camera-side source tee
+-> leaky raw-record queue
+-> hardware H.264 encoder
+-> local clean MKV
+```
+
+That means the recording is valid dataset material and does not include:
+
+- OSD
+- debug crosshair
+- RTSP drawing
+- preview artifacts
+
+### Latency Summary
+
+```bash
+python3 /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/tools/bridge_latency_report.py
+```
+
+### Failure Summary
+
+```bash
+python3 /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/tools/bridge_failure_report.py
+```
+
+### Detector-Miss Fallback On The Recorded Video
+
+```bash
+/home/saturnzzz/DeepStream-Yolo/.venv-yolo26-sys/bin/python /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/tools/extract_detector_miss_frames_from_video.py --video /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/runs/latest/recording_clean.mkv --weights /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/model/best.pt --class-id 0 --conf 0.10 --imgsz 640 --min-miss-frames 6 --max-miss-frames 600 --frames-per-segment 4 --progress-every 300 --device cpu
+```
+
+## Runtime Architecture
+
+Actual live control flow:
 
 ```text
 CSI camera
 -> DeepStream / YOLO / tracker
 -> tracker src pad-probe
--> latest-only shared-memory metadata snapshot
+-> latest-only binary shared-memory metadata snapshot
 -> separate Python bridge loop
 -> MAVLink / PX4 gimbal-manager
 -> SIYI gimbal
 ```
 
-At the same time, the monitoring branch stays on the video side:
+Monitoring / operator path:
 
 ```text
 tracker output
@@ -474,55 +716,25 @@ tracker output
 -> rtsp queue -> H.264 -> RTSP
 ```
 
-### What Is Cleanly Separated Now
+Dataset recording path:
 
-- live gimbal commands are not sent inside the DeepStream callback
-- the Python bridge reads only the latest metadata snapshot
-- slow preview or RTSP no longer causes the bridge to replay old metadata line by line
-- the display and RTSP paths sit behind leaky queues, so they are allowed to fall behind and drop frames
-- `RTSP_ENABLE=0` now really disables the RTSP encode/stream branch
-
-### What This Means In Practice
-
-- the control branch can stay fresher than the monitoring branch
-- the MK15 stream or local preview may be a few frames behind, and that is acceptable
-- the important goal is that the gimbal follows fresh target metadata, not old display frames
-
-The timing fields below are the proof for this:
-
-- `ds_to_py_ms` shows metadata handoff latency into the Python bridge
-- `display_frame_lag` shows how far preview trails the current control frame
-- `rtsp_frame_lag` shows how far RTSP trails the current control frame
-- `mav_send_to_feedback_ms` shows the observed command-to-feedback timing when PX4/gimbal feedback is available
-
-### Residual Weak Point
-
-The architecture is cleaner now, but it is not the absolute final form yet.
-
-The main remaining weak point is the DeepStream tracker callback:
-
-- it still does target selection and raw target-state extraction in C
-- the common video path still uses one shared OSD stage before the final display/RTSP sink split
-- if debug metadata logging is enabled with flush, it can still do per-frame file sync work
-
-So the system is now in a good practical state, but the most purist end-state would be:
-
-- C tracker probe: extract/select latest target metadata, publish it, return immediately
-- Python bridge loop: read latest snapshot, compute final smoothed control output, send MAVLink
-- Video branch: preview / RTSP / recording only, with full sink isolation if a stable branch-local OSD path is available
-
-## How This Profile Works
-
-This profile follows the `prototype_v2` architecture from the diagram, but here it is written in engineering terms.
+```text
+camera-side source tee
+-> leaky raw-record queue
+-> hardware H.264 encoder
+-> clean MKV
+```
 
 ### System-Level Flow
+
+This is the conceptual `prototype_v2` workflow for this profile:
 
 ```text
 CSI camera
 -> GStreamer / DeepStream video pipeline
 -> primary detector (YOLO)
 -> multi-object tracker
--> target-selection + control-law stage
+-> target-selection + raw control-metadata stage
 -> split into 2 logical branches:
    1. video / monitoring branch
    2. metadata / control branch
@@ -531,13 +743,13 @@ CSI camera
 ### Detailed Pipeline Meaning
 
 1. `CSI camera -> DeepStream pipeline`
-   - the image enters through the Jetson CSI camera path
-   - in practice this is the video source for the full pipeline
-   - from the architecture point of view, this is the image path that should stay inside the high-performance pipeline
+   - the image enters through the Jetson CSI path
+   - in practice this is the live source for the full runtime
+   - from the architecture point of view, this image path should stay inside the high-performance pipeline
 
 2. `DeepStream pipeline -> primary inference stage`
    - YOLO is the primary object detector
-   - this stage produces detections such as:
+   - this stage produces:
      - class id
      - confidence
      - bounding box
@@ -549,19 +761,19 @@ CSI camera
    - it is maintaining tracked targets over time
    - this is what makes single-target follow possible
 
-4. `tracker -> target-selection + raw metadata stage`
+4. `tracker -> target-selection + raw control-metadata stage`
    - one tracked target is selected for control
-   - from that selected target, the profile computes the control-side quantities:
+   - from that selected target, the profile computes the raw control-side quantities:
      - target center in image coordinates
      - normalized image-plane error:
        - `dx_norm`
        - `dy_norm`
-   - that raw target state is published as the latest snapshot for the Python bridge
-   - the final smoothed / shaped command is computed in the Python bridge, not in the DeepStream C callback
+   - that raw target state is published into the latest-only shared-memory snapshot
+   - the final smoothed / shaped control output is then computed in the Python bridge, not in the DeepStream C callback
 
 ### The Important Branch Split
 
-After detection, tracking, and target-control calculation, the profile splits into 2 branches:
+After detection, tracking, and target-control calculation, the profile is logically split into 2 branches.
 
 ```text
 DeepStream detect/track/control source
@@ -582,7 +794,7 @@ DeepStream app
   - tracking IDs
   - selected target
   - crosshair / error line / control overlay
-- this branch is not the control loop itself
+- this branch is **not** the control loop itself
 
 #### Branch B: Metadata / Control Branch
 
@@ -590,6 +802,7 @@ DeepStream app
 tracked target metadata
 -> target position / bbox center
 -> normalized image-center error
+-> virtual pan_cmd / tilt_cmd stage
 -> latest shared-memory snapshot
 -> PX4 bridge
 -> filtered / shaped pan_cmd / tilt_cmd
@@ -599,7 +812,7 @@ tracked target metadata
 
 - this is the real control branch
 - this branch should use lightweight target metadata, not full exported video frames
-- the important control variables are derived from tracked metadata inside the separate Python bridge loop, not from the RTSP stream and not from a second full-frame CPU image path
+- the important control variables are derived from tracked metadata, not from the RTSP stream and not from a second full-frame CPU-side image-processing path
 
 So the real control chain is:
 
@@ -608,107 +821,171 @@ detect
 -> track
 -> choose target
 -> compute dx_norm / dy_norm
+-> compute virtual pan_cmd / tilt_cmd intent
 -> publish latest metadata snapshot
--> Python bridge computes pan_cmd / tilt_cmd
+-> Python bridge computes final smoothed pan_cmd / tilt_cmd
 -> map into MAVLink gimbal commands
 -> send through PX4
 -> move SIYI
 ```
 
-### Why This Matches the Diagram
+### What Is Clean Now
 
-This is the key architectural idea from the earlier diagram discussion:
+- live MAVLink send is not done in the DeepStream callback
+- latest metadata handoff is binary, not per-frame JSON parsing
+- Python bridge reads only the latest snapshot
+- metadata older than `METADATA_MAX_AGE_MS` is treated as stale
+- RTSP can be disabled independently with `RTSP_ENABLE=0`
+- monitoring branch queues are leaky by design
+- monitoring branch errors are non-fatal by default
+- run health and latency proof are built into the runtime
 
-- the image path should stay in the DeepStream / GPU-oriented pipeline
-- the video branch exists for preview / streaming / monitoring
-- the control branch should consume only metadata-level information
-- the gimbal should follow the metadata/control branch, not the preview stream itself
+### Current Default Hardening
 
-In other words:
+Important runtime defaults now in effect:
 
-- full-frame video is for display / streaming
-- metadata is for control
+- `METADATA_MAX_AGE_MS=150`
+- `MONITORING_ERRORS_FATAL=0`
+- `RUN_ARTIFACTS_ENABLE=1`
+- `PRINT_HEALTH=0` unless you enable it in the launch
 
-That is why `prototype_v2` is the future optimized direction:
+Useful debug overrides:
 
-- it separates monitoring from control
-- it avoids using full exported image frames as the main control signal
-- it uses target metadata and image-plane error as the control input to `PX4 -> SIYI`
+- `export METADATA_MAX_AGE_MS=0`
+  - disables the stale-metadata age gate
+- `export MONITORING_ERRORS_FATAL=1`
+  - returns to strict fail-fast behavior if you want the whole app to stop on monitoring branch errors
 
-Live control path in the current implementation:
+### Current Residual Weak Point
 
-```text
-CSI camera
--> DeepStream / YOLO / tracker
--> tracker src pad-probe
--> latest-only shared-memory metadata snapshot
--> separate Python bridge loop
--> MAVLink / PX4 gimbal-manager
--> SIYI gimbal
-```
+The architecture is already in a good practical state, but one weak point still remains:
 
-Monitoring path in the current implementation:
+- the DeepStream tracker callback still owns target selection / target state extraction in C
 
-```text
-tracker output
--> leaky video queue
--> nvvideoconvert
--> nvdsosd
--> tee
--> display queue -> local preview
--> rtsp queue -> H.264 -> RTSP
-```
+That is acceptable for now. Do not casually refactor it unless there is a measured reason.
 
-Dataset recording path when `RAW_RECORD_ENABLE=1`:
+## Runtime Timing And Health Fields
 
-```text
-camera-side source tee
--> leaky raw-record queue
--> hardware H.264 encoder
--> local clean MKV under recordings/
-```
+The main bridge log is `detection_log.jsonl`.
 
-Important meaning:
+Useful timing fields:
 
-- the gimbal does not follow the RTSP video
-- the bridge does not replay old metadata line by line
-- the final control shaping happens in Python, not inside the DeepStream callback
-- clean dataset recording is separate from OSD/RTSP and does not contain overlays
-- the control branch should use lightweight metadata only, not full video frames
-
-## Runtime Timing Fields
-
-When `BRIDGE_STATE_FILE` is enabled, the bridge log can show separation/latency metrics such as:
-
-- `ds_to_py_ms`
-  - live metadata handoff latency from DeepStream publish to Python read
-- `mav_send_to_feedback_ms`
-  - command send to observed PX4/gimbal feedback timing when feedback is available
+- `vision_latency_ms`
+  - video pipeline timing from frame-side handoff into metadata publish
+- `metadata_age_ms`
+  - age of the latest metadata when Python uses it
+- `mavlink_delay_ms`
+  - Python control step to MAVLink send timing
+- `feedback_delay_ms`
+  - send-to-feedback timing when live feedback exists
 - `display_frame_lag`
-  - how many frames the preview branch trails the current control frame
+  - preview lag in frames
 - `rtsp_frame_lag`
-  - how many frames the RTSP branch trails the current control frame
+  - RTSP lag in frames
+- `metadata_gap_frames`
+  - missed metadata sequence gaps
+- `video_frame_gap`
+  - frame index gaps
 
-## Files That Matter
+Health print is optional and low-rate:
 
-- [config/config_infer_primary_yolo26.txt](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/config/config_infer_primary_yolo26.txt)
-  - points to the `target_face` ONNX / engine / labels
-  - one class only
-- [prepare_prototype_v2_model.sh](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/prepare_prototype_v2_model.sh)
-  - exports the ONNX from `model/best.pt`
-- [run_deepstream_yolo26_rtsp_target_control.sh](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_yolo26_rtsp_target_control.sh)
-  - launches the DeepStream app
-- [run_deepstream_px4_siyi_bridge.sh](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_px4_siyi_bridge.sh)
-  - launches the full live bridge path
-- [tools/extract_latest_failure_frames.sh](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/tools/extract_latest_failure_frames.sh)
-  - extracts labelable failure frames from the newest clean recording and bridge log
+```bash
+export PRINT_HEALTH=1
+export HEALTH_PRINT_INTERVAL_SEC=1.0
+```
 
-## Next Iteration Targets
+It summarizes:
 
-The runtime side is now in a usable state. The next work should be about model quality, not basic bring-up.
+- camera status
+- DeepStream status
+- YOLO FPS
+- target state / ID
+- metadata age
+- control Hz
+- MAVLink status
+- gimbal feedback status
+- Jetson temperature
+- video branch status
+- recording status
 
-Useful next checks:
+## Current Control Preset
 
-1. evaluate `target_face` stability on real scenes, distance changes, and partial views
-2. decide whether `v2` needs better data coverage, tighter labels, or harder negatives
-3. compare `v1` serious-engine behavior against any future `v2` training run under the same runtime settings
+Current accepted live preset:
+
+```text
+TARGET_CLASS_ID=0
+SELECTION=center
+PAN_GAIN=0.91
+TILT_GAIN=0.83
+DEADZONE=0.048
+SMOOTH_ALPHA=0.39
+FAST_SMOOTH_ALPHA=0.81
+FAST_ERROR_ZONE=0.15
+COMMAND_BOOST_ZONE=0.095
+MIN_ACTIVE_COMMAND=0.20
+RESPONSE_GAMMA=0.63
+PAN_FEEDFORWARD_GAIN=0.18
+TILT_FEEDFORWARD_GAIN=0.12
+FEEDFORWARD_ALPHA=0.40
+FEEDFORWARD_LIMIT=0.14
+FEEDFORWARD_ACTIVATION_ZONE=0.07
+MAX_YAW_RATE_DPS=95
+MAX_PITCH_RATE_DPS=60
+CONTROL_API=command
+LIVE_CONTROL_MODE=angle-target
+MAV_INVERT_PAN=0
+MAV_INVERT_TILT=0
+```
+
+Use launcher defaults first. Override manually only when you are intentionally tuning.
+
+## Quick Health Checks
+
+### Camera
+
+```bash
+gst-launch-1.0 -q nvarguscamerasrc sensor-id=0 num-buffers=1 ! 'video/x-raw(memory:NVMM),width=2028,height=1112,framerate=60/1' ! fakesink
+```
+
+### Serial / Gimbal Adapter
+
+```bash
+ls -l /dev/ttyUSB* /dev/serial/by-id 2>/dev/null
+```
+
+### Local RTSP Check
+
+```bash
+ffprobe -rtsp_transport tcp -v error -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate -of default=nw=1 rtsp://127.0.0.1:8554/stream
+```
+
+## Notes To Future Humans And Codex
+
+Do not casually break these invariants:
+
+- keep IMX412 as the normal deployment camera
+- keep `2028x1112 @ 60` as the normal camera default unless testing says otherwise
+- keep control metadata latest-only
+- do not move live MAVLink send back into the DeepStream callback
+- do not make RTSP or preview a required dependency for control
+- do not assume RTSP lag means gimbal lag
+- do not rename ONNX / engine files unless infer config and scripts are updated too
+- when changing launch behavior, update this README and the sub-docs in the same pass
+
+If you need more detail for the operator path:
+
+- MK15 / RTSP specifics:
+  - `streaming/README.md`
+- clean recording / extraction specifics:
+  - `recordings/README.md`
+
+## Next Work
+
+The basic runtime architecture is already in a good state.
+
+Next work should mainly be:
+
+1. model quality improvements under real scenes
+2. controlled comparisons across power modes
+3. dataset growth from real failure frames and clean field video
+4. only then deeper control-loop redesigns, if measurements justify them

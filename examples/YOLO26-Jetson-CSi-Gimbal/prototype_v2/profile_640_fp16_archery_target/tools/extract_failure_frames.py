@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 VIDEO_TS_RE = re.compile(r"(\d{8}-\d{6})")
+PROFILE_DIR = Path(__file__).resolve().parent.parent
 
 
 @dataclass
@@ -47,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bridge-log",
         default="",
-        help="Bridge JSONL log path; if omitted, the newest common archery-target bridge log is used",
+        help="Bridge JSONL log path; if omitted, runs/latest/detection_log.jsonl is preferred, then the newest legacy /tmp log",
     )
     parser.add_argument(
         "--video",
@@ -91,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         default="",
-        help="Optional extraction root; defaults to sibling folder under recordings/",
+        help="Optional extraction root; defaults to a sibling folder next to the video",
     )
     return parser.parse_args()
 
@@ -103,16 +104,20 @@ def resolve_bridge_log(path_arg: str) -> Path:
             raise SystemExit(f"Bridge log not found: {path}")
         return path
 
-    candidates = [
+    run_bundle_candidate = PROFILE_DIR / "runs/latest/detection_log.jsonl"
+    if run_bundle_candidate.exists():
+        return run_bundle_candidate
+
+    legacy_candidates = [
         Path("/tmp/profile640fp16_archery_target_mk15_live_bridge.jsonl"),
         Path("/tmp/profile640fp16_archery_target_live_bridge.jsonl"),
         Path("/tmp/profile640fp16_archery_target_bridge_dryrun.jsonl"),
     ]
-    existing = [path for path in candidates if path.exists()]
+    existing = [path for path in legacy_candidates if path.exists()]
     if not existing:
         raise SystemExit(
             "Bridge log not found. Checked: "
-            + ", ".join(str(candidate) for candidate in candidates)
+            + ", ".join(str(candidate) for candidate in [run_bundle_candidate, *legacy_candidates])
         )
     return max(existing, key=lambda path: path.stat().st_mtime)
 
@@ -312,10 +317,11 @@ def infer_video_start_epoch(video: Path) -> float:
         pass
 
     match = VIDEO_TS_RE.search(video.name)
-    if not match:
-        raise ValueError(f"Could not infer start timestamp from video filename: {video.name}")
-    dt = datetime.strptime(match.group(1), "%Y%m%d-%H%M%S")
-    return dt.timestamp()
+    if match:
+        dt = datetime.strptime(match.group(1), "%Y%m%d-%H%M%S")
+        return dt.timestamp()
+
+    return video.stat().st_mtime
 
 
 def choose_row_positions(length: int, frames_per_segment: int) -> list[int]:

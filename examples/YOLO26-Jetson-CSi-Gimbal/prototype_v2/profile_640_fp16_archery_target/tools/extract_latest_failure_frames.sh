@@ -4,27 +4,36 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RECORDINGS_DIR="${PROFILE_DIR}/recordings"
+RUNS_DIR="${PROFILE_DIR}/runs"
 
 if [[ -z "${VIDEO:-}" ]]; then
-  VIDEO="$(find "${RECORDINGS_DIR}" -maxdepth 1 -type f -name 'archery_target_clean_*.mkv' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  if [[ -f "${RUNS_DIR}/latest/recording_clean.mkv" ]]; then
+    VIDEO="${RUNS_DIR}/latest/recording_clean.mkv"
+  else
+    VIDEO="$(find "${RECORDINGS_DIR}" -maxdepth 1 -type f -name 'archery_target_clean_*.mkv' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  fi
 fi
 
 if [[ -z "${VIDEO:-}" ]]; then
-  echo "No clean recording found under ${RECORDINGS_DIR}" >&2
+  echo "No clean recording found under ${RUNS_DIR}/latest or ${RECORDINGS_DIR}" >&2
   echo "Run the flight/test launch with RAW_RECORD_ENABLE=1 first." >&2
   exit 1
 fi
 
 if [[ -z "${BRIDGE_LOG:-}" ]]; then
-  BRIDGE_LOG="$(find /tmp -maxdepth 1 -type f \( \
-      -name 'profile640fp16_archery_target_mk15_live_bridge.jsonl' -o \
-      -name 'profile640fp16_archery_target_live_bridge.jsonl' -o \
-      -name 'profile640fp16_archery_target_bridge_dryrun.jsonl' \
-    \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  if [[ -f "${RUNS_DIR}/latest/detection_log.jsonl" ]]; then
+    BRIDGE_LOG="${RUNS_DIR}/latest/detection_log.jsonl"
+  else
+    BRIDGE_LOG="$(find /tmp -maxdepth 1 -type f \( \
+        -name 'profile640fp16_archery_target_mk15_live_bridge.jsonl' -o \
+        -name 'profile640fp16_archery_target_live_bridge.jsonl' -o \
+        -name 'profile640fp16_archery_target_bridge_dryrun.jsonl' \
+      \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  fi
 fi
 
 if [[ -z "${BRIDGE_LOG:-}" ]]; then
-  echo "No bridge JSONL log found in /tmp" >&2
+  echo "No bridge JSONL log found in ${RUNS_DIR}/latest or /tmp" >&2
   exit 1
 fi
 
