@@ -128,6 +128,18 @@ class PrototypeV2BridgeState:
     # ===== FEEDBACK TIMING ADDED END =====
     status: str
     command_status: str
+    target_memory_enabled: bool
+    target_memory_level: int
+    target_memory_state: str
+    tracking_quality: str
+    target_memory_track_id: int | None
+    memory_age_ms: float | None
+    target_uncertainty: float
+    predicted_yaw_deg: float | None
+    predicted_pitch_deg: float | None
+    local_search_offset_yaw_deg: float
+    local_search_offset_pitch_deg: float
+    reacquired: bool
     visible_tracks: int
     lost_frames: int
     target_id: int | None
@@ -183,6 +195,29 @@ class LiveControlFilterState:
     smooth_tilt_feedforward_rate: float = 0.0
     last_pan_error: float = 0.0
     last_tilt_error: float = 0.0
+
+
+@dataclass
+class TargetMemoryState:
+    state: str = "SEARCH"
+    tracking_quality: str = "SEARCHING"
+    track_id: int | None = None
+    stable_frames: int = 0
+    last_seen_mono_ns: int | None = None
+    last_update_mono_ns: int | None = None
+    last_seen_frame_idx: int | None = None
+    last_seen_yaw_target_deg: float | None = None
+    last_seen_pitch_target_deg: float | None = None
+    last_seen_confidence: float | None = None
+    last_seen_dx_norm: float | None = None
+    last_seen_dy_norm: float | None = None
+    uncertainty: float = 1.0
+    predicted_yaw_deg: float | None = None
+    predicted_pitch_deg: float | None = None
+    local_search_offset_yaw_deg: float = 0.0
+    local_search_offset_pitch_deg: float = 0.0
+    reacquired: bool = False
+    candidate_from_lost: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -290,6 +325,102 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-yaw-angle-deg", type=float, default=60.0, help="Clamp live yaw target within +/- this angle")
     parser.add_argument("--min-pitch-angle-deg", type=float, default=-45.0, help="Minimum live pitch target angle")
     parser.add_argument("--max-pitch-angle-deg", type=float, default=25.0, help="Maximum live pitch target angle")
+    parser.add_argument(
+        "--target-memory-enable",
+        action="store_true",
+        default=env_bool_default("TARGET_MEMORY_ENABLE", False),
+        help="Enable Level 1 target memory: hold last trusted angle and local search after visual loss",
+    )
+    parser.add_argument(
+        "--target-memory-level",
+        type=int,
+        default=env_int_default("TARGET_MEMORY_LEVEL", 1),
+        help="Target memory level. Current implementation supports Level 1 only.",
+    )
+    parser.add_argument(
+        "--search-pitch-default",
+        type=float,
+        default=env_float_default("SEARCH_PITCH_DEFAULT", -45.0),
+        help="Fallback pitch angle used by wide-search state",
+    )
+    parser.add_argument(
+        "--candidate-stable-frames",
+        type=int,
+        default=env_int_default("CANDIDATE_STABLE_FRAMES", 3),
+        help="Stable visual frames required before memory state reports LOCKED_VISUAL",
+    )
+    parser.add_argument(
+        "--short-lost-timeout-ms",
+        type=float,
+        default=env_float_default("SHORT_LOST_TIMEOUT_MS", 450.0),
+        help="Short visual loss window that only coasts on the last angle",
+    )
+    parser.add_argument(
+        "--predict-timeout-ms",
+        type=float,
+        default=env_float_default("PREDICT_TIMEOUT_MS", 1200.0),
+        help="How long to point at the last remembered angle before local search begins",
+    )
+    parser.add_argument(
+        "--local-search-timeout-ms",
+        type=float,
+        default=env_float_default("LOCAL_SEARCH_TIMEOUT_MS", 3000.0),
+        help="How long to search locally around the remembered angle before wide search",
+    )
+    parser.add_argument(
+        "--wide-search-timeout-ms",
+        type=float,
+        default=env_float_default("WIDE_SEARCH_TIMEOUT_MS", 5000.0),
+        help="How long to remain in wide search before reporting mission retry/fail",
+    )
+    parser.add_argument(
+        "--local-search-initial-deg",
+        type=float,
+        default=env_float_default("LOCAL_SEARCH_INITIAL_DEG", 3.0),
+        help="Initial local-search yaw amplitude around remembered angle",
+    )
+    parser.add_argument(
+        "--local-search-max-deg",
+        type=float,
+        default=env_float_default("LOCAL_SEARCH_MAX_DEG", 10.0),
+        help="Maximum local-search yaw amplitude as uncertainty grows",
+    )
+    parser.add_argument(
+        "--local-search-pitch-scale",
+        type=float,
+        default=env_float_default("LOCAL_SEARCH_PITCH_SCALE", 0.35),
+        help="Pitch search amplitude as a fraction of yaw search amplitude",
+    )
+    parser.add_argument(
+        "--search-rate-deg-s",
+        type=float,
+        default=env_float_default("SEARCH_RATE_DEG_S", 18.0),
+        help="Approximate peak local-search angular sweep rate",
+    )
+    parser.add_argument(
+        "--uncertainty-growth-rate",
+        type=float,
+        default=env_float_default("UNCERTAINTY_GROWTH_RATE", 0.35),
+        help="Target memory uncertainty increase per second while target is lost",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=env_float_default("CONFIDENCE_THRESHOLD", 0.35),
+        help="Confidence below this marks tracking as unstable",
+    )
+    parser.add_argument(
+        "--edge-margin-threshold",
+        type=float,
+        default=env_float_default("EDGE_MARGIN_THRESHOLD", 0.82),
+        help="Absolute normalized image error above this marks tracking as near-edge unstable",
+    )
+    parser.add_argument(
+        "--tracking-unstable-threshold",
+        type=float,
+        default=env_float_default("TRACKING_UNSTABLE_THRESHOLD", 0.70),
+        help="Reserved stability threshold for future quality scoring; logged through config for reproducibility",
+    )
     parser.add_argument("--yaw-lock", action="store_true", help="Use yaw-lock mode instead of vehicle-frame yaw")
     parser.add_argument("--pitch-lock", action="store_true", help="Set the pitch-lock flag in manager commands")
     parser.add_argument("--mav-invert-pan", action="store_true", help="Invert pan when converting to yaw rate")
@@ -721,6 +852,202 @@ def update_angle_targets(
     return next_pitch, next_yaw
 
 
+def _target_memory_age_ms(memory: TargetMemoryState, now_ns: int) -> float | None:
+    if memory.last_seen_mono_ns is None:
+        return None
+    return _delta_ms(now_ns, memory.last_seen_mono_ns)
+
+
+def _target_memory_dt(memory: TargetMemoryState, now_ns: int) -> float:
+    if memory.last_update_mono_ns is None:
+        memory.last_update_mono_ns = now_ns
+        return 0.0
+    dt = max(0.0, (now_ns - memory.last_update_mono_ns) / 1e9)
+    memory.last_update_mono_ns = now_ns
+    return min(dt, 0.5)
+
+
+def _target_memory_visible_is_unstable(
+    *,
+    confidence: float | None,
+    dx_norm: float,
+    dy_norm: float,
+    args: argparse.Namespace,
+) -> bool:
+    confidence_bad = confidence is not None and confidence < args.confidence_threshold
+    near_edge = max(abs(dx_norm), abs(dy_norm)) >= args.edge_margin_threshold
+    return confidence_bad or near_edge
+
+
+def _target_memory_search_offsets(
+    *,
+    lost_elapsed_ms: float,
+    uncertainty: float,
+    args: argparse.Namespace,
+) -> tuple[float, float]:
+    initial_amp = max(0.0, args.local_search_initial_deg)
+    max_amp = max(initial_amp, args.local_search_max_deg)
+    amp = initial_amp + (max_amp - initial_amp) * clamp(uncertainty, 0.0, 1.0)
+    if amp <= 1e-6:
+        return 0.0, 0.0
+
+    local_elapsed_s = max(0.0, (lost_elapsed_ms - args.predict_timeout_ms) / 1000.0)
+    omega = abs(args.search_rate_deg_s) / max(amp, 1e-3)
+    phase = local_elapsed_s * omega
+    yaw_offset = amp * math.sin(phase)
+    # Pitch search is smaller and phase-shifted so the pattern covers a local patch, not just a line.
+    pitch_amp = amp * clamp(abs(args.local_search_pitch_scale), 0.0, 1.0)
+    pitch_offset = pitch_amp * math.sin(phase * 0.5)
+    return yaw_offset, pitch_offset
+
+
+def target_memory_plan_lost_command(
+    *,
+    memory: TargetMemoryState,
+    now_ns: int,
+    args: argparse.Namespace,
+) -> tuple[float | None, float | None]:
+    """Update Level 1 memory state during visual loss and return an optional angle override."""
+    dt = _target_memory_dt(memory, now_ns)
+    memory.reacquired = False
+    memory.uncertainty = clamp(memory.uncertainty + abs(args.uncertainty_growth_rate) * dt, 0.0, 1.0)
+    memory.local_search_offset_yaw_deg = 0.0
+    memory.local_search_offset_pitch_deg = 0.0
+
+    if memory.last_seen_mono_ns is None or memory.last_seen_yaw_target_deg is None or memory.last_seen_pitch_target_deg is None:
+        memory.state = "SEARCH"
+        memory.tracking_quality = "SEARCHING"
+        memory.predicted_yaw_deg = None
+        memory.predicted_pitch_deg = None
+        return None, None
+
+    lost_elapsed_ms = _target_memory_age_ms(memory, now_ns) or 0.0
+    predicted_yaw = memory.last_seen_yaw_target_deg
+    predicted_pitch = memory.last_seen_pitch_target_deg
+
+    if lost_elapsed_ms <= max(0.0, args.short_lost_timeout_ms):
+        memory.state = "LOST_COAST"
+        memory.tracking_quality = "TARGET_LOST_SHORT"
+    elif lost_elapsed_ms <= max(args.short_lost_timeout_ms, args.predict_timeout_ms):
+        memory.state = "LOST_POINT_TO_LAST_ANGLE"
+        memory.tracking_quality = "TARGET_LOST_SHORT"
+    elif lost_elapsed_ms <= max(args.predict_timeout_ms, args.predict_timeout_ms + args.local_search_timeout_ms):
+        memory.state = "LOCAL_SEARCH"
+        memory.tracking_quality = "TARGET_LOST_LONG"
+        yaw_offset, pitch_offset = _target_memory_search_offsets(
+            lost_elapsed_ms=lost_elapsed_ms,
+            uncertainty=memory.uncertainty,
+            args=args,
+        )
+        memory.local_search_offset_yaw_deg = yaw_offset
+        memory.local_search_offset_pitch_deg = pitch_offset
+        predicted_yaw += yaw_offset
+        predicted_pitch += pitch_offset
+    elif lost_elapsed_ms <= (
+        max(args.predict_timeout_ms, args.predict_timeout_ms + args.local_search_timeout_ms)
+        + max(0.0, args.wide_search_timeout_ms)
+    ):
+        memory.state = "WIDE_SEARCH"
+        memory.tracking_quality = "TARGET_LOST_LONG"
+        yaw_offset, pitch_offset = _target_memory_search_offsets(
+            lost_elapsed_ms=lost_elapsed_ms,
+            uncertainty=1.0,
+            args=args,
+        )
+        memory.local_search_offset_yaw_deg = yaw_offset
+        memory.local_search_offset_pitch_deg = pitch_offset
+        predicted_yaw += yaw_offset
+        predicted_pitch = args.search_pitch_default + pitch_offset
+    else:
+        memory.state = "MISSION_RETRY_OR_FAIL"
+        memory.tracking_quality = "REACQUIRE_FAILED"
+        predicted_yaw = 0.0
+        predicted_pitch = 0.0
+        memory.local_search_offset_yaw_deg = 0.0
+        memory.local_search_offset_pitch_deg = 0.0
+
+    memory.predicted_yaw_deg = clamp(predicted_yaw, -args.max_yaw_angle_deg, args.max_yaw_angle_deg)
+    memory.predicted_pitch_deg = clamp(predicted_pitch, args.min_pitch_angle_deg, args.max_pitch_angle_deg)
+    return memory.predicted_pitch_deg, memory.predicted_yaw_deg
+
+
+def target_memory_update_visible(
+    *,
+    memory: TargetMemoryState,
+    now_ns: int,
+    frame_idx: int,
+    target_id: int | None,
+    confidence: float | None,
+    dx_norm: float,
+    dy_norm: float,
+    target_pitch_deg: float,
+    target_yaw_deg: float,
+    args: argparse.Namespace,
+) -> None:
+    """Update Level 1 memory from a fresh visual target after the normal visual command update."""
+    _target_memory_dt(memory, now_ns)
+    previous_state = memory.state
+    previous_track_id = memory.track_id
+    memory.reacquired = False
+
+    if target_id is None:
+        return
+
+    if previous_track_id == target_id:
+        memory.stable_frames += 1
+    else:
+        memory.track_id = target_id
+        memory.stable_frames = 1
+
+    unstable = _target_memory_visible_is_unstable(
+        confidence=confidence,
+        dx_norm=dx_norm,
+        dy_norm=dy_norm,
+        args=args,
+    )
+    stable = memory.stable_frames >= max(1, args.candidate_stable_frames)
+
+    was_lost_state = previous_state in {
+        "LOST_COAST",
+        "LOST_POINT_TO_LAST_ANGLE",
+        "LOCAL_SEARCH",
+        "WIDE_SEARCH",
+        "MISSION_RETRY_OR_FAIL",
+    }
+    if was_lost_state and not stable:
+        memory.candidate_from_lost = True
+    if stable and (was_lost_state or memory.candidate_from_lost):
+        memory.reacquired = True
+        memory.candidate_from_lost = False
+
+    if not stable:
+        memory.state = "CANDIDATE"
+        memory.tracking_quality = "CANDIDATE"
+    elif unstable:
+        memory.state = "TRACKING_UNSTABLE"
+        memory.tracking_quality = "TRACKING_UNSTABLE"
+    else:
+        memory.state = "LOCKED_VISUAL"
+        memory.tracking_quality = "TRACKING_CONFIDENCE_HIGH"
+
+    edge_score = min(1.0, max(abs(dx_norm), abs(dy_norm)))
+    conf_score = 0.0 if confidence is None else clamp(confidence, 0.0, 1.0)
+    measurement_uncertainty = clamp((1.0 - conf_score) + edge_score * 0.35, 0.0, 1.0)
+    memory.uncertainty = smooth_value(memory.uncertainty, measurement_uncertainty, 0.45)
+
+    memory.last_seen_mono_ns = now_ns
+    memory.last_seen_frame_idx = frame_idx
+    memory.last_seen_yaw_target_deg = target_yaw_deg
+    memory.last_seen_pitch_target_deg = target_pitch_deg
+    memory.last_seen_confidence = confidence
+    memory.last_seen_dx_norm = dx_norm
+    memory.last_seen_dy_norm = dy_norm
+    memory.predicted_yaw_deg = target_yaw_deg
+    memory.predicted_pitch_deg = target_pitch_deg
+    memory.local_search_offset_yaw_deg = 0.0
+    memory.local_search_offset_pitch_deg = 0.0
+
+
 def emit_state(state: PrototypeV2BridgeState, print_state: bool, state_handle) -> None:
     payload = json.dumps(asdict(state), separators=(",", ":"))
     if print_state:
@@ -792,14 +1119,17 @@ def build_health_state(
 
     camera_ok = deepstream_ok and state.frame_idx >= 0 and state.metadata_is_fresh
 
+    target_state = state.target_memory_state if state.target_memory_enabled else state.status
+    target_id = state.target_id if state.target_id is not None else state.target_memory_track_id
+
     return PrototypeV2HealthState(
         timestamp=state.timestamp,
         camera_ok=camera_ok,
         deepstream_ok=deepstream_ok,
         inference_fps=inference_fps,
         metadata_age_ms=state.metadata_age_ms,
-        target_state=state.status,
-        target_id=state.target_id,
+        target_state=target_state,
+        target_id=target_id,
         control_hz=control_hz,
         mavlink_ok=state.mavlink_connected,
         gimbal_feedback_ok=feedback_ok,
@@ -952,6 +1282,15 @@ def main() -> int:
     target_yaw_deg = clamp(args.initial_yaw_deg, -args.max_yaw_angle_deg, args.max_yaw_angle_deg)
     previous_time = time.perf_counter()
     filter_state = LiveControlFilterState()
+    target_memory_state = TargetMemoryState()
+    target_memory_supported = args.target_memory_enable and args.target_memory_level == 1
+    if args.target_memory_enable and args.target_memory_level != 1:
+        print(
+            f"WARNING: TARGET_MEMORY_LEVEL={args.target_memory_level} is not implemented yet; "
+            "running without target-memory recovery.",
+            file=sys.stderr,
+            flush=True,
+        )
     metadata_fd: int | None = None
     metadata_mm: mmap.mmap | None = None
     metadata_sequence = 0
@@ -1032,6 +1371,14 @@ def main() -> int:
             has_target = metadata_is_fresh and target_id is not None and status not in {"searching", "lost"}
             raw_dx_norm = float(record.get("dx_norm", 0.0) or 0.0) if has_target else 0.0
             raw_dy_norm = float(record.get("dy_norm", 0.0) or 0.0) if has_target else 0.0
+            target_memory_pitch_override: float | None = None
+            target_memory_yaw_override: float | None = None
+            if target_memory_supported and not has_target:
+                target_memory_pitch_override, target_memory_yaw_override = target_memory_plan_lost_command(
+                    memory=target_memory_state,
+                    now_ns=py_read_mono_ns,
+                    args=args,
+                )
 
             current_time = time.perf_counter()
             delta = min(max(current_time - previous_time, 1e-6), 0.1)
@@ -1060,6 +1407,28 @@ def main() -> int:
                     dt=delta,
                     args=args,
                 )
+            if target_memory_supported:
+                if has_target:
+                    target_memory_update_visible(
+                        memory=target_memory_state,
+                        now_ns=py_read_mono_ns,
+                        frame_idx=current_frame_idx,
+                        target_id=int(target_id) if target_id is not None else None,
+                        confidence=record.get("confidence"),
+                        dx_norm=raw_dx_norm,
+                        dy_norm=raw_dy_norm,
+                        target_pitch_deg=target_pitch_deg,
+                        target_yaw_deg=target_yaw_deg,
+                        args=args,
+                    )
+                    if target_memory_state.tracking_quality == "TRACKING_UNSTABLE" and command_status == "active":
+                        command_status = "unstable"
+                    elif target_memory_state.reacquired:
+                        command_status = "reacquired"
+                elif target_memory_pitch_override is not None and target_memory_yaw_override is not None:
+                    target_pitch_deg = target_memory_pitch_override
+                    target_yaw_deg = target_memory_yaw_override
+                    command_status = target_memory_state.state.lower()
             # ===== LATENCY STAGE 1/2/3 ADDED START =====
             # Stage 1 T3: immediately before this bridge sends the MAVLink command.
             mav_send_mono_ns = time.monotonic_ns()
@@ -1192,6 +1561,22 @@ def main() -> int:
                 # ===== FEEDBACK TIMING ADDED END =====
                 status=status,
                 command_status=command_status,
+                target_memory_enabled=target_memory_supported,
+                target_memory_level=1 if target_memory_supported else 0,
+                target_memory_state=target_memory_state.state if target_memory_supported else "DISABLED",
+                tracking_quality=target_memory_state.tracking_quality if target_memory_supported else "DISABLED",
+                target_memory_track_id=target_memory_state.track_id if target_memory_supported else None,
+                memory_age_ms=_target_memory_age_ms(target_memory_state, py_read_mono_ns) if target_memory_supported else None,
+                target_uncertainty=target_memory_state.uncertainty if target_memory_supported else 0.0,
+                predicted_yaw_deg=target_memory_state.predicted_yaw_deg if target_memory_supported else None,
+                predicted_pitch_deg=target_memory_state.predicted_pitch_deg if target_memory_supported else None,
+                local_search_offset_yaw_deg=(
+                    target_memory_state.local_search_offset_yaw_deg if target_memory_supported else 0.0
+                ),
+                local_search_offset_pitch_deg=(
+                    target_memory_state.local_search_offset_pitch_deg if target_memory_supported else 0.0
+                ),
+                reacquired=target_memory_state.reacquired if target_memory_supported else False,
                 visible_tracks=visible_tracks,
                 lost_frames=lost_frames,
                 target_id=target_id,

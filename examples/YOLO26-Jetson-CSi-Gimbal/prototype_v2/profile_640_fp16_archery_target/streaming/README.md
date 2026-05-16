@@ -191,6 +191,8 @@ This wrapper already carries the current working defaults:
 - `RTSP_MOUNT=/stream`
 - `CONTROL_API=command`
 - `LIVE_CONTROL_MODE=angle-target`
+- `TARGET_MEMORY_ENABLE=1`
+- `TARGET_MEMORY_LEVEL=1`
 - `MAV_INVERT_PAN=0`
 - `MAV_INVERT_TILT=0`
 - current accepted tuning block for `target_face`
@@ -239,6 +241,22 @@ export CONTROL_API=command
 export LIVE_CONTROL_MODE=angle-target
 export INITIAL_YAW_DEG=0.0
 export INITIAL_PITCH_DEG=0.0
+export TARGET_MEMORY_ENABLE=1
+export TARGET_MEMORY_LEVEL=1
+export SEARCH_PITCH_DEFAULT=-45.0
+export CANDIDATE_STABLE_FRAMES=3
+export SHORT_LOST_TIMEOUT_MS=450
+export PREDICT_TIMEOUT_MS=1200
+export LOCAL_SEARCH_TIMEOUT_MS=3000
+export WIDE_SEARCH_TIMEOUT_MS=5000
+export LOCAL_SEARCH_INITIAL_DEG=3.0
+export LOCAL_SEARCH_MAX_DEG=10.0
+export LOCAL_SEARCH_PITCH_SCALE=0.35
+export SEARCH_RATE_DEG_S=18.0
+export UNCERTAINTY_GROWTH_RATE=0.35
+export CONFIDENCE_THRESHOLD=0.35
+export EDGE_MARGIN_THRESHOLD=0.82
+export TRACKING_UNSTABLE_THRESHOLD=0.70
 export YAW_LOCK=0
 export PITCH_LOCK=0
 export MAV_INVERT_PAN=0
@@ -265,6 +283,14 @@ Preflight hold-angle note:
 - example for a slight downward camera angle before takeoff:
   - `export INITIAL_PITCH_DEG=-12.0`
 - `PITCH_LOCK=1` and `YAW_LOCK=1` are optional lock-mode flags; keep them at `0` unless you intentionally want lock behavior
+
+Level 1 reacquisition note:
+
+- `TARGET_MEMORY_ENABLE=1` is the current normal setting
+- if target metadata disappears briefly, the bridge holds the last trusted yaw/pitch instead of resetting
+- after `PREDICT_TIMEOUT_MS`, it searches locally around the remembered angle
+- logs expose `target_memory_state`, `tracking_quality`, `target_uncertainty`, and local-search offsets in `runs/latest/detection_log.jsonl`
+- set `TARGET_MEMORY_ENABLE=0` if you need the old pure visual behavior for comparison
 
 What this gives you:
 

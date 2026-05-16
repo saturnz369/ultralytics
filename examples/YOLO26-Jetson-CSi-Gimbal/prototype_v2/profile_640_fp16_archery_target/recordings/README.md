@@ -59,6 +59,22 @@ export CONTROL_API=command
 export LIVE_CONTROL_MODE=angle-target
 export INITIAL_YAW_DEG=0.0
 export INITIAL_PITCH_DEG=0.0
+export TARGET_MEMORY_ENABLE=1
+export TARGET_MEMORY_LEVEL=1
+export SEARCH_PITCH_DEFAULT=-45.0
+export CANDIDATE_STABLE_FRAMES=3
+export SHORT_LOST_TIMEOUT_MS=450
+export PREDICT_TIMEOUT_MS=1200
+export LOCAL_SEARCH_TIMEOUT_MS=3000
+export WIDE_SEARCH_TIMEOUT_MS=5000
+export LOCAL_SEARCH_INITIAL_DEG=3.0
+export LOCAL_SEARCH_MAX_DEG=10.0
+export LOCAL_SEARCH_PITCH_SCALE=0.35
+export SEARCH_RATE_DEG_S=18.0
+export UNCERTAINTY_GROWTH_RATE=0.35
+export CONFIDENCE_THRESHOLD=0.35
+export EDGE_MARGIN_THRESHOLD=0.82
+export TRACKING_UNSTABLE_THRESHOLD=0.70
 export YAW_LOCK=0
 export PITCH_LOCK=0
 export MAV_INVERT_PAN=0
@@ -85,6 +101,8 @@ Preflight hold-angle note:
 - example:
   - `export INITIAL_PITCH_DEG=-12.0`
 - `PITCH_LOCK=1` and `YAW_LOCK=1` are optional lock-mode flags; keep them at `0` unless you intentionally want that behavior
+- `TARGET_MEMORY_ENABLE=1` enables Level 1 last-angle recovery during visual dropouts
+- set `TARGET_MEMORY_ENABLE=0` only when you intentionally want old behavior for an A/B comparison
 
 What this means:
 

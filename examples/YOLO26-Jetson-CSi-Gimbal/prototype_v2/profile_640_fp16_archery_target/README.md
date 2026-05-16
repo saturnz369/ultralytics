@@ -60,6 +60,10 @@ This is the current known-good state of the profile:
 - monitoring branch errors are disposable by default
 - run artifacts are bundled automatically under `runs/<tag>/`
 - health printing / health log / latency summary are integrated
+- Level 1 target memory is integrated in the Python bridge:
+  - when visual target is lost briefly, hold/coast on the last trusted gimbal angle
+  - after a short timeout, perform local search around that remembered angle
+  - no geo/vehicle-pose recovery is enabled yet
 
 Current active runtime files:
 
@@ -554,6 +558,22 @@ export CONTROL_API=command
 export LIVE_CONTROL_MODE=angle-target
 export INITIAL_YAW_DEG=0.0
 export INITIAL_PITCH_DEG=0.0
+export TARGET_MEMORY_ENABLE=1
+export TARGET_MEMORY_LEVEL=1
+export SEARCH_PITCH_DEFAULT=-45.0
+export CANDIDATE_STABLE_FRAMES=3
+export SHORT_LOST_TIMEOUT_MS=450
+export PREDICT_TIMEOUT_MS=1200
+export LOCAL_SEARCH_TIMEOUT_MS=3000
+export WIDE_SEARCH_TIMEOUT_MS=5000
+export LOCAL_SEARCH_INITIAL_DEG=3.0
+export LOCAL_SEARCH_MAX_DEG=10.0
+export LOCAL_SEARCH_PITCH_SCALE=0.35
+export SEARCH_RATE_DEG_S=18.0
+export UNCERTAINTY_GROWTH_RATE=0.35
+export CONFIDENCE_THRESHOLD=0.35
+export EDGE_MARGIN_THRESHOLD=0.82
+export TRACKING_UNSTABLE_THRESHOLD=0.70
 export YAW_LOCK=0
 export PITCH_LOCK=0
 export MAV_INVERT_PAN=0
@@ -577,6 +597,24 @@ Preflight hold-angle note:
   - `INITIAL_PITCH_DEG=-12.0`
 - `PITCH_LOCK=1` and `YAW_LOCK=1` are optional MAVLink gimbal-manager lock flags
 - keep them at `0` unless you intentionally want lock mode
+
+Level 1 target-memory note:
+
+- `TARGET_MEMORY_ENABLE=1` enables the current last-angle recovery layer
+- if YOLO/tracker misses briefly, the bridge stays in `LOST_COAST` and keeps the last trusted angle
+- after `PREDICT_TIMEOUT_MS`, it enters `LOCAL_SEARCH` around the remembered yaw/pitch
+- after local search timeout, it reports `WIDE_SEARCH` or `MISSION_RETRY_OR_FAIL`
+- set `TARGET_MEMORY_ENABLE=0` to return to the old pure visual-control behavior
+- if recovery fully fails, `MISSION_RETRY_OR_FAIL` recenters the gimbal to neutral instead of leaving it parked on the last lost angle
+
+Future target-memory levels to come back to:
+
+- Level 2: attitude-compensated recovery
+  - use drone attitude and gimbal feedback to keep the remembered line of sight stable through vehicle motion
+- Level 3: velocity-compensated recovery
+  - use drone velocity to predict how fast the target direction should drift while the aircraft keeps moving
+- Level 4: ground-point recovery
+  - estimate a ground-referenced target point from pose, altitude, and camera/gimbal geometry, then re-point from that estimate after loss
 
 ### 6. Real Full Control With MK15
 
@@ -860,10 +898,60 @@ detect
 -> compute virtual pan_cmd / tilt_cmd intent
 -> publish latest metadata snapshot
 -> Python bridge computes final smoothed pan_cmd / tilt_cmd
+-> Level 1 target memory may hold/search around last trusted angle during target loss
 -> map into MAVLink gimbal commands
 -> send through PX4
 -> move SIYI
 ```
+
+### Target Memory And Reacquisition
+
+Current implemented level:
+
+- `TARGET_MEMORY_LEVEL=1`
+- last-angle recovery only
+- no drone attitude compensation yet
+- no velocity compensation yet
+- no ground-point estimate yet
+
+Level 1 behavior:
+
+```text
+LOCKED_VISUAL
+-> target temporarily missing
+-> LOST_COAST: keep last trusted yaw/pitch
+-> LOST_POINT_TO_LAST_ANGLE: keep pointing at remembered direction
+-> LOCAL_SEARCH: small smooth search around remembered yaw/pitch
+-> WIDE_SEARCH: fallback search pitch and wider local yaw motion
+-> MISSION_RETRY_OR_FAIL: tell logs/offboard that visual recovery failed
+```
+
+Why this belongs in Python:
+
+- DeepStream C callback stays metadata-only
+- memory / state-manager / recovery policy lives in the fixed-rate bridge loop
+- MAVLink still receives only the latest intended command
+
+Current recovery log fields in `detection_log.jsonl`:
+
+- `target_memory_enabled`
+- `target_memory_level`
+- `target_memory_state`
+- `tracking_quality`
+- `target_memory_track_id`
+- `memory_age_ms`
+- `target_uncertainty`
+- `predicted_yaw_deg`
+- `predicted_pitch_deg`
+- `local_search_offset_yaw_deg`
+- `local_search_offset_pitch_deg`
+- `reacquired`
+
+Future levels need more PX4 telemetry before implementation:
+
+- Level 2 attitude compensation needs vehicle attitude and decoded gimbal attitude
+- Level 3 velocity compensation needs local/global velocity
+- Level 4 ground-point recovery needs vehicle position, altitude, camera/gimbal calibration, and a ground-plane assumption
 
 ### What Is Clean Now
 
@@ -881,6 +969,8 @@ detect
 Important runtime defaults now in effect:
 
 - `METADATA_MAX_AGE_MS=150`
+- `TARGET_MEMORY_ENABLE=1`
+- `TARGET_MEMORY_LEVEL=1`
 - `MONITORING_ERRORS_FATAL=0`
 - `RUN_ARTIFACTS_ENABLE=1`
 - `PRINT_HEALTH=0` unless you enable it in the launch
@@ -969,6 +1059,14 @@ MAX_YAW_RATE_DPS=95
 MAX_PITCH_RATE_DPS=60
 CONTROL_API=command
 LIVE_CONTROL_MODE=angle-target
+TARGET_MEMORY_ENABLE=1
+TARGET_MEMORY_LEVEL=1
+SHORT_LOST_TIMEOUT_MS=450
+PREDICT_TIMEOUT_MS=1200
+LOCAL_SEARCH_TIMEOUT_MS=3000
+LOCAL_SEARCH_INITIAL_DEG=3.0
+LOCAL_SEARCH_MAX_DEG=10.0
+SEARCH_RATE_DEG_S=18.0
 MAV_INVERT_PAN=0
 MAV_INVERT_TILT=0
 ```
