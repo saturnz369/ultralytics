@@ -165,6 +165,13 @@ ls -l /dev/ttyUSB* /dev/serial/by-id 2>/dev/null
 
 This profile is built around the e-con `e-CAM121_CUONX` / IMX412 stack. If the IMX412 side stops working, this is the driver workflow that got it working on this Jetson.
 
+Important path note:
+
+- the absolute paths in this section, such as `/home/saturnzzz/...`, are the paths from this working Jetson
+- on another identical Jetson, replace `/home/saturnzzz/...` with the correct path for that machine and user
+- practical example:
+  - if the new machine uses user `ubuntu`, then `/home/saturnzzz/e-CAM121_CUONX` becomes `/home/ubuntu/e-CAM121_CUONX`
+
 Vendor reference folder:
 
 ```bash
@@ -185,6 +192,23 @@ Important:
   - camera on `CAM1`
   - `22-pin`, `0.5 mm pitch`, `Type A` FFC
   - correct cable orientation on both ends
+
+### IMX412 Base System Check
+
+Before installing the IMX412 driver on another Jetson, confirm the OS baseline matches:
+
+```bash
+cat /etc/nv_tegra_release
+uname -r
+```
+
+Expected baseline for this profile:
+
+- JetPack `6.2.1`
+- L4T `36.4.4`
+- kernel `5.15.148-tegra`
+
+If the new Jetson does not match this baseline, do not assume this exact camera-driver workflow will behave the same way.
 
 ### IMX412 Fresh Install
 
@@ -528,6 +552,10 @@ export MAX_YAW_RATE_DPS=95
 export MAX_PITCH_RATE_DPS=60
 export CONTROL_API=command
 export LIVE_CONTROL_MODE=angle-target
+export INITIAL_YAW_DEG=0.0
+export INITIAL_PITCH_DEG=0.0
+export YAW_LOCK=0
+export PITCH_LOCK=0
 export MAV_INVERT_PAN=0
 export MAV_INVERT_TILT=0
 export SERIAL_DEVICE='/dev/ttyUSB0'
@@ -541,6 +569,14 @@ export PRINT_HEALTH=1
 export HEALTH_PRINT_INTERVAL_SEC=1.0
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/run_deepstream_px4_siyi_bridge.sh
 ```
+
+Preflight hold-angle note:
+
+- `INITIAL_PITCH_DEG` and `INITIAL_YAW_DEG` set the first angle-target hold setpoint before live tracking starts
+- if you want the camera to start slightly looking down before flight, change for example:
+  - `INITIAL_PITCH_DEG=-12.0`
+- `PITCH_LOCK=1` and `YAW_LOCK=1` are optional MAVLink gimbal-manager lock flags
+- keep them at `0` unless you intentionally want lock mode
 
 ### 6. Real Full Control With MK15
 

@@ -26,7 +26,9 @@ METADATA_IPC_MAGIC = 0x5056324D
 METADATA_IPC_VERSION = 3
 METADATA_IPC_PAYLOAD_MAX = 8192
 METADATA_IPC_HEADER = struct.Struct("<IIIIQQqII")
-METADATA_IPC_PAYLOAD = struct.Struct("<qqqqqQQIqIqIqIqII8xQiIddd64s32s32s")
+# Packed C layout from MetadataIpcPayload in deepstream_yolo26_rtsp_target_control.c:
+# ... visible_tracks:u32, lost_frames:u32, has_target:u8, reserved0[7], target_id:u64 ...
+METADATA_IPC_PAYLOAD = struct.Struct("<qqqqqQQIqIqIqIqIIB7xQiIddd64s32s32s")
 METADATA_IPC_SIZE = METADATA_IPC_HEADER.size + METADATA_IPC_PAYLOAD_MAX
 
 
@@ -272,6 +274,18 @@ def parse_args() -> argparse.Namespace:
         default="angle-target",
         choices=("angle-target", "rate"),
         help="Use angle-target integration or direct rate commands",
+    )
+    parser.add_argument(
+        "--initial-yaw-deg",
+        type=float,
+        default=env_float_default("INITIAL_YAW_DEG", 0.0),
+        help="Initial yaw target used for the first hold setpoint in angle-target mode",
+    )
+    parser.add_argument(
+        "--initial-pitch-deg",
+        type=float,
+        default=env_float_default("INITIAL_PITCH_DEG", 0.0),
+        help="Initial pitch target used for the first hold setpoint in angle-target mode",
     )
     parser.add_argument("--max-yaw-angle-deg", type=float, default=60.0, help="Clamp live yaw target within +/- this angle")
     parser.add_argument("--min-pitch-angle-deg", type=float, default=-45.0, help="Minimum live pitch target angle")
@@ -579,9 +593,10 @@ def _decode_metadata_payload(
         rtsp_queue_src_mono_ns,
         visible_tracks,
         lost_frames,
-        has_target,
+        has_target_raw,
         target_id,
         class_id,
+        _reserved1,
         confidence,
         dx_norm,
         dy_norm,
@@ -590,7 +605,7 @@ def _decode_metadata_payload(
         command_status_raw,
     ) = METADATA_IPC_PAYLOAD.unpack(payload_bytes)
 
-    has_target = bool(has_target)
+    has_target = bool(has_target_raw)
     class_name = _decode_c_string(class_name_raw)
     status = _decode_c_string(status_raw) or "searching"
     command_status = _decode_c_string(command_status_raw) or status
@@ -832,12 +847,17 @@ def emit_health_state(health: PrototypeV2HealthState, print_health: bool, health
         health_handle.flush()
 
 
-def prime_live_control(bridge: PX4SiyiBridge, args: argparse.Namespace) -> None:
-    """Send a neutral live-control setpoint once after configure."""
+def prime_live_control(
+    bridge: PX4SiyiBridge,
+    args: argparse.Namespace,
+    initial_pitch_deg: float,
+    initial_yaw_deg: float,
+) -> None:
+    """Send the initial live-control hold setpoint once after configure."""
     if args.live_control_mode == "angle-target":
         bridge.send_pitchyaw(
-            pitch_angle_deg=0.0,
-            yaw_angle_deg=0.0,
+            pitch_angle_deg=initial_pitch_deg,
+            yaw_angle_deg=initial_yaw_deg,
             force=True,
             wait_ack=False,
         )
@@ -928,8 +948,8 @@ def main() -> int:
 
     proc, log_handle = start_combined_app(args, metadata_ipc_file, metadata_state_file)
     bridge = PX4SiyiBridge(args)
-    target_pitch_deg = 0.0
-    target_yaw_deg = 0.0
+    target_pitch_deg = clamp(args.initial_pitch_deg, args.min_pitch_angle_deg, args.max_pitch_angle_deg)
+    target_yaw_deg = clamp(args.initial_yaw_deg, -args.max_yaw_angle_deg, args.max_yaw_angle_deg)
     previous_time = time.perf_counter()
     filter_state = LiveControlFilterState()
     metadata_fd: int | None = None
@@ -945,7 +965,7 @@ def main() -> int:
     try:
         wait_for_metadata_ipc_file(metadata_ipc_file, proc, args.startup_timeout)
         bridge.connect()
-        prime_live_control(bridge, args)
+        prime_live_control(bridge, args, target_pitch_deg, target_yaw_deg)
 
         metadata_fd = os.open(metadata_ipc_file, os.O_RDONLY)
         metadata_mm = mmap.mmap(metadata_fd, METADATA_IPC_SIZE, access=mmap.ACCESS_READ)

@@ -237,6 +237,10 @@ export MAX_YAW_RATE_DPS=95
 export MAX_PITCH_RATE_DPS=60
 export CONTROL_API=command
 export LIVE_CONTROL_MODE=angle-target
+export INITIAL_YAW_DEG=0.0
+export INITIAL_PITCH_DEG=0.0
+export YAW_LOCK=0
+export PITCH_LOCK=0
 export MAV_INVERT_PAN=0
 export MAV_INVERT_TILT=0
 export SERIAL_DEVICE='/dev/ttyUSB0'
@@ -254,6 +258,13 @@ export HEALTH_PRINT_INTERVAL_SEC=1.0
 export RUN_ARTIFACTS_ENABLE=1
 bash /home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/streaming/run_mk15_yolo_gimbal_rtsp.sh
 ```
+
+Preflight hold-angle note:
+
+- `INITIAL_PITCH_DEG` and `INITIAL_YAW_DEG` set the first angle-target hold setpoint before tracking starts
+- example for a slight downward camera angle before takeoff:
+  - `export INITIAL_PITCH_DEG=-12.0`
+- `PITCH_LOCK=1` and `YAW_LOCK=1` are optional lock-mode flags; keep them at `0` unless you intentionally want lock behavior
 
 What this gives you:
 
