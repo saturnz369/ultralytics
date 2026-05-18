@@ -249,11 +249,17 @@ def parse_args() -> argparse.Namespace:
         help="Treat metadata older than this as stale and fall back to lost-target behavior",
     )
     parser.add_argument("--pan-gain", type=float, default=env_float_default("PAN_GAIN", 0.91))
-    parser.add_argument("--tilt-gain", type=float, default=env_float_default("TILT_GAIN", 0.83))
+    parser.add_argument("--tilt-gain", type=float, default=env_float_default("TILT_GAIN", 0.55))
     parser.add_argument("--deadzone", type=float, default=env_float_default("DEADZONE", 0.048))
     parser.add_argument("--smooth-alpha", type=float, default=env_float_default("SMOOTH_ALPHA", 0.39))
     parser.add_argument("--fast-smooth-alpha", type=float, default=env_float_default("FAST_SMOOTH_ALPHA", 0.81))
     parser.add_argument("--fast-error-zone", type=float, default=env_float_default("FAST_ERROR_ZONE", 0.15))
+    parser.add_argument("--tilt-deadzone", type=float, default=env_float_default("TILT_DEADZONE", 0.10))
+    parser.add_argument("--tilt-smooth-alpha", type=float, default=env_float_default("TILT_SMOOTH_ALPHA", 0.18))
+    parser.add_argument(
+        "--tilt-fast-smooth-alpha", type=float, default=env_float_default("TILT_FAST_SMOOTH_ALPHA", 0.45)
+    )
+    parser.add_argument("--tilt-fast-error-zone", type=float, default=env_float_default("TILT_FAST_ERROR_ZONE", 0.35))
     parser.add_argument("--command-boost-zone", type=float, default=env_float_default("COMMAND_BOOST_ZONE", 0.095))
     parser.add_argument("--min-active-command", type=float, default=env_float_default("MIN_ACTIVE_COMMAND", 0.20))
     parser.add_argument("--response-gamma", type=float, default=env_float_default("RESPONSE_GAMMA", 0.63))
@@ -265,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tilt-feedforward-gain",
         type=float,
-        default=env_float_default("TILT_FEEDFORWARD_GAIN", 0.12),
+        default=env_float_default("TILT_FEEDFORWARD_GAIN", 0.04),
     )
     parser.add_argument("--feedforward-alpha", type=float, default=env_float_default("FEEDFORWARD_ALPHA", 0.40))
     parser.add_argument("--feedforward-limit", type=float, default=env_float_default("FEEDFORWARD_LIMIT", 0.14))
@@ -299,10 +305,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ack-timeout", type=float, default=2.0, help="Seconds to wait for COMMAND_ACK")
     parser.add_argument("--send-rate-hz", type=float, default=20.0, help="Maximum MAVLink pitch/yaw command rate")
     parser.add_argument(
-        "--max-yaw-rate-dps", type=float, default=60.0, help="Maximum yaw rate in deg/s at pan_cmd=+/-1"
+        "--max-yaw-rate-dps", type=float, default=90.0, help="Maximum yaw rate in deg/s at pan_cmd=+/-1"
     )
     parser.add_argument(
-        "--max-pitch-rate-dps", type=float, default=45.0, help="Maximum pitch rate in deg/s at tilt_cmd=+/-1"
+        "--max-pitch-rate-dps", type=float, default=90.0, help="Maximum pitch rate in deg/s at tilt_cmd=+/-1"
     )
     parser.add_argument(
         "--live-control-mode",
@@ -322,9 +328,30 @@ def parse_args() -> argparse.Namespace:
         default=env_float_default("INITIAL_PITCH_DEG", 0.0),
         help="Initial pitch target used for the first hold setpoint in angle-target mode",
     )
-    parser.add_argument("--max-yaw-angle-deg", type=float, default=60.0, help="Clamp live yaw target within +/- this angle")
-    parser.add_argument("--min-pitch-angle-deg", type=float, default=-45.0, help="Minimum live pitch target angle")
-    parser.add_argument("--max-pitch-angle-deg", type=float, default=25.0, help="Maximum live pitch target angle")
+    parser.add_argument(
+        "--min-yaw-angle-deg",
+        type=float,
+        default=env_float_default("MIN_YAW_ANGLE_DEG", -100.0),
+        help="Minimum live yaw target angle",
+    )
+    parser.add_argument(
+        "--max-yaw-angle-deg",
+        type=float,
+        default=env_float_default("MAX_YAW_ANGLE_DEG", 100.0),
+        help="Maximum live yaw target angle",
+    )
+    parser.add_argument(
+        "--min-pitch-angle-deg",
+        type=float,
+        default=env_float_default("MIN_PITCH_ANGLE_DEG", -90.0),
+        help="Minimum live pitch target angle",
+    )
+    parser.add_argument(
+        "--max-pitch-angle-deg",
+        type=float,
+        default=env_float_default("MAX_PITCH_ANGLE_DEG", 25.0),
+        help="Maximum live pitch target angle",
+    )
     parser.add_argument(
         "--target-memory-enable",
         action="store_true",
@@ -502,9 +529,24 @@ def smooth_value(previous: float, current: float, alpha: float) -> float:
 
 
 def select_smooth_alpha(error_mag: float, args: argparse.Namespace) -> float:
-    base = clamp(args.smooth_alpha, 0.0, 1.0)
-    fast = clamp(args.fast_smooth_alpha, 0.0, 1.0)
-    zone = abs(args.fast_error_zone)
+    return select_smooth_alpha_values(
+        error_mag,
+        base_alpha=args.smooth_alpha,
+        fast_alpha=args.fast_smooth_alpha,
+        fast_error_zone=args.fast_error_zone,
+    )
+
+
+def select_smooth_alpha_values(
+    error_mag: float,
+    *,
+    base_alpha: float,
+    fast_alpha: float,
+    fast_error_zone: float,
+) -> float:
+    base = clamp(base_alpha, 0.0, 1.0)
+    fast = clamp(fast_alpha, 0.0, 1.0)
+    zone = abs(fast_error_zone)
 
     if fast < base:
         fast = base
@@ -590,9 +632,14 @@ def compute_control_outputs(
         return filter_state.smooth_pan_error, filter_state.smooth_tilt_error, 0.0, 0.0, "no_target"
 
     pan_error = apply_deadzone(dx_norm, args.deadzone)
-    tilt_error = apply_deadzone(dy_norm, args.deadzone)
+    tilt_error = apply_deadzone(dy_norm, args.tilt_deadzone)
     pan_alpha = select_smooth_alpha(abs(pan_error), args)
-    tilt_alpha = select_smooth_alpha(abs(tilt_error), args)
+    tilt_alpha = select_smooth_alpha_values(
+        abs(tilt_error),
+        base_alpha=args.tilt_smooth_alpha,
+        fast_alpha=args.tilt_fast_smooth_alpha,
+        fast_error_zone=args.tilt_fast_error_zone,
+    )
     ff_alpha = clamp(args.feedforward_alpha, 0.0, 1.0)
     dt_sec = dt if 1e-3 <= dt <= 0.5 else nominal_dt
 
@@ -848,7 +895,7 @@ def update_angle_targets(
     next_pitch = current_pitch_deg + pitch_rate_dps * dt
     next_yaw = current_yaw_deg + yaw_rate_dps * dt
     next_pitch = clamp(next_pitch, args.min_pitch_angle_deg, args.max_pitch_angle_deg)
-    next_yaw = clamp(next_yaw, -args.max_yaw_angle_deg, args.max_yaw_angle_deg)
+    next_yaw = clamp(next_yaw, args.min_yaw_angle_deg, args.max_yaw_angle_deg)
     return next_pitch, next_yaw
 
 
@@ -966,7 +1013,7 @@ def target_memory_plan_lost_command(
         memory.local_search_offset_yaw_deg = 0.0
         memory.local_search_offset_pitch_deg = 0.0
 
-    memory.predicted_yaw_deg = clamp(predicted_yaw, -args.max_yaw_angle_deg, args.max_yaw_angle_deg)
+    memory.predicted_yaw_deg = clamp(predicted_yaw, args.min_yaw_angle_deg, args.max_yaw_angle_deg)
     memory.predicted_pitch_deg = clamp(predicted_pitch, args.min_pitch_angle_deg, args.max_pitch_angle_deg)
     return memory.predicted_pitch_deg, memory.predicted_yaw_deg
 
@@ -1279,7 +1326,7 @@ def main() -> int:
     proc, log_handle = start_combined_app(args, metadata_ipc_file, metadata_state_file)
     bridge = PX4SiyiBridge(args)
     target_pitch_deg = clamp(args.initial_pitch_deg, args.min_pitch_angle_deg, args.max_pitch_angle_deg)
-    target_yaw_deg = clamp(args.initial_yaw_deg, -args.max_yaw_angle_deg, args.max_yaw_angle_deg)
+    target_yaw_deg = clamp(args.initial_yaw_deg, args.min_yaw_angle_deg, args.max_yaw_angle_deg)
     previous_time = time.perf_counter()
     filter_state = LiveControlFilterState()
     target_memory_state = TargetMemoryState()
