@@ -165,6 +165,107 @@ If serial or USB naming changes after reconnecting hardware, check:
 ls -l /dev/ttyUSB* /dev/serial/by-id 2>/dev/null
 ```
 
+## MK15 And Operator View Setup
+
+This main README should carry the shared MK15/operator setup, while the deeper launch variants and stream-specific troubleshooting stay in:
+
+- [streaming/README.md](/home/saturnzzz/ultralytics/examples/YOLO26-Jetson-CSi-Gimbal/prototype_v2/profile_640_fp16_archery_target/streaming/README.md)
+
+### Plain Meaning
+
+Current monitoring path:
+
+```text
+CSI camera -> Jetson -> H.264 RTSP -> MK15 air unit -> MK15 handheld FPV app
+```
+
+For the full combined runtime:
+
+```text
+CSI camera -> DeepStream / YOLO / tracker / control metadata -> PX4 / SIYI gimbal
+                                         -> H.264 RTSP -> MK15 FPV
+```
+
+Important separation:
+
+- the `RTSP stream` is the monitoring/video branch
+- the `gimbal control` path is separate and uses metadata/MAVLink, not the RTSP video itself
+
+### Jetson Ethernet To MK15
+
+Current working convention:
+
+- Jetson internet/Codex link stays on Wi-Fi
+- Jetson Ethernet `enP8p1s0` goes to the MK15 air unit LAN side
+- the Jetson RTSP address exposed to MK15 is:
+  - `rtsp://192.168.144.100:8554/stream`
+
+If the MK15 Ethernet profile is not already created on this Jetson, use:
+
+```bash
+sudo nmcli con add type ethernet ifname enP8p1s0 con-name mk15 \
+  ipv4.method manual ipv4.addresses 192.168.144.100/24 \
+  ipv4.never-default yes ipv6.method ignore
+sudo nmcli con up mk15
+```
+
+Quick check:
+
+```bash
+ip -br addr show enP8p1s0
+ping -I enP8p1s0 -c 2 192.168.144.11
+```
+
+Expected Jetson Ethernet address:
+
+```text
+192.168.144.100/24
+```
+
+### MK15 FPV App Side
+
+On the MK15 handheld:
+
+1. Open the `FPV` app.
+2. Set `Camera A` to `rtsp://192.168.144.100:8554/stream`.
+3. Reopen the stream view after the Jetson launcher is running.
+
+Practical meaning:
+
+- camera-only RTSP, YOLO-overlay RTSP, and the full YOLO+gimbal launch all reuse the same MK15 URL
+- `QGroundControl` is not required for video-only MK15 stream testing
+
+### Local Jetson Preview
+
+The optional local preview window is separate from the MK15 stream.
+
+Current working convention:
+
+- local preview usually comes from the desktop display session at `DISPLAY=:1`
+- preview-enabled launch blocks in this profile already export `DISPLAY=:1`
+- if you do not want the local preview window, use `SHOW=0`
+
+Practical note:
+
+- local preview requires an active Jetson GUI session
+- MK15 RTSP can still run with `SHOW=0`
+
+### Stream Size Meaning
+
+Do not mix up these 3 things:
+
+1. camera capture size into the pipeline
+2. YOLO inference size
+3. RTSP output shown on MK15
+
+Current profile defaults:
+
+- camera capture: `2028x1112 @ 60`
+- YOLO inference: `640x640`
+- MK15 RTSP path in this profile also runs from the same `2028x1112 @ 60` capture mode unless you intentionally override the launch vars
+
+So `profile_640_fp16` describes the inference profile, not the MK15 stream resolution.
+
 ## IMX412 Driver Setup And Recovery Workflow
 
 This profile is built around the e-con `e-CAM121_CUONX` / IMX412 stack. If the IMX412 side stops working, this is the driver workflow that got it working on this Jetson.
